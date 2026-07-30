@@ -19,3 +19,19 @@ class SummarizeOrdersTests(unittest.TestCase):
             "user_paid": 210.0,
             "items": [{"name": "测试商品", "quantity": 1}],
         }])
+
+    def test_summarize_skips_malformed_orders(self):
+        good = {
+            "commonInfo": '{"wm_order_id_view": "123", "orderStatus": 2}',
+            "orderInfo": '{"chargeInfo": {"userPayTotalAmount": 210.0}, "unifiedBasicInfo": {"wmPoiName": "测试门店", "orderStatusDesc": "待接单"}, "foodInfo": {"cartDetails": []}}',
+        }
+        payload = {
+            "data": {"orderList": [
+                good,
+                {"commonInfo": "not-json"},          # 嵌套 JSON 损坏
+                {"orderInfo": "{}"},                  # 缺 commonInfo
+            ]}
+        }
+        result = summarize_orders(payload)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["order_id"], "123")
