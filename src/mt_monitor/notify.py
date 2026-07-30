@@ -17,12 +17,18 @@ from .wechat_webhook import WechatWebhookClient, WechatWebhookError, load_webhoo
 
 SEEN_FILE = Path("data/seen_orders.json")
 
+# Source label prepended to every pushed message so the group can tell which
+# monitor sent it (e.g. when several shop bots share one WeChat group).
+SOURCE_LABEL = "美团闪购"
+
 
 def format_notification(order: dict, status: str) -> str:
     """Render one order as a plain-text message for the robot.
 
     Always surfaces the three fields the business cares about: order id,
-    status and store, plus a short product list.
+    status and store, plus a short product list. The message is prefixed
+    with ``SOURCE_LABEL`` so the destination group knows it came from the
+    Meituan monitor.
     """
     items = order.get("items", []) or []
     names = "、".join(
@@ -30,7 +36,8 @@ def format_notification(order: dict, status: str) -> str:
         for it in items[:5]
         if isinstance(it, dict)
     ) or "商品信息待确认"
-    return "{}\n订单号：{}\n门店：{}\n商品：{}".format(
+    return "【{}】{}\n订单号：{}\n门店：{}\n商品：{}".format(
+        SOURCE_LABEL,
         status,
         order.get("order_id", ""),
         order.get("store", ""),
