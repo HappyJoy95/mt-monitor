@@ -18,7 +18,10 @@ class SaveSnapshotTests(unittest.TestCase):
 
             self.assertEqual(raw_path.parent.name, "raw")
             self.assertEqual(raw_path.name[-16:], "-order-list.json")
-            self.assertEqual(json.loads(raw_path.read_text(encoding="utf-8")), payload)
+            raw_text = raw_path.read_text(encoding="utf-8")
+            self.assertIn("\n  ", raw_text)
+            self.assertIn("测试", raw_text)
+            self.assertEqual(json.loads(raw_text), payload)
             self.assertEqual(summary_path, Path(directory) / "data/latest-orders.json")
             self.assertEqual(
                 json.loads(summary_path.read_text(encoding="utf-8")), summary
