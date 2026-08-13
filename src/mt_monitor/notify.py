@@ -97,6 +97,8 @@ def format_store_deployment_message(
         f"门店名称：{store_name}\n"
         f"营业时间：{start_time} ~ {end_time}\n"
         f"推送平台：{SOURCE_LABEL}订单监控\n"
+        "推送频率：每分钟一次\n"
+        "推送状态：待接单\n"
         "————————————\n"
         "状态：配置完成，正常推送中"
     )
