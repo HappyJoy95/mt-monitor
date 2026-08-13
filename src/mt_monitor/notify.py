@@ -87,6 +87,43 @@ def format_notification(order: dict, status: str) -> str:
     )
 
 
+def format_store_deployment_message(
+    store_name: str, start_time: str, end_time: str
+) -> str:
+    """Format a store deployment confirmation message (scheme B)."""
+    return (
+        f"【{SOURCE_LABEL}】门店推送配置确认\n"
+        "————————————\n"
+        f"门店名称：{store_name}\n"
+        f"营业时间：{start_time} ~ {end_time}\n"
+        f"推送平台：{SOURCE_LABEL}订单监控\n"
+        "————————————\n"
+        "状态：配置完成，正常推送中"
+    )
+
+
+def send_store_deployment_message(
+    webhook_url: str,
+    store_name: str,
+    start_time: str,
+    end_time: str,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Send deployment confirmation to a store's webhook. Returns True on success."""
+    text = format_store_deployment_message(store_name, start_time, end_time)
+    if dry_run:
+        print(f"[dry-run] 门店部署确认消息：\n{text}\n")
+        return True
+    try:
+        client = WechatWebhookClient(webhook_url)
+        client.send_text(text)
+        return True
+    except WechatWebhookError as exc:
+        print(f"⚠️ 门店部署确认推送失败（{store_name}）：{exc}", file=sys.stderr)
+        return False
+
+
 def _load_seen(root: Path) -> set:
     p = Path(root) / SEEN_FILE
     if p.exists():
