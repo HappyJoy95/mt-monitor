@@ -101,8 +101,29 @@ python -m unittest discover -s tests -v
 cgi-bin/webhook/send` 且含 `key`），避免误填。URL 含密钥，已被 `.gitignore`
 排除（`config/notify`）。
 
+### 门店群推送
+
+除主推送外，支持按门店名将订单推送到对应门店的企业微信群。门店映射表配置在
+`config/store_webhooks.json`（不提交 Git），格式：
+
+```json
+[
+  {
+    "门店名": "华为授权体验店（悦荟广场店）",
+    "营业开始时间": "09:30:00",
+    "营业结束时间": "21:00:00",
+    "webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+  }
+]
+```
+
+- 订单的 `store` 字段与 `门店名` 精确匹配时，会额外推送到该门店的群。
+- 推送仅在 `营业开始时间` ~ `营业结束时间` 内执行（支持跨午夜，如 22:00-06:00）。
+- 未映射的门店或非营业时间内，跳过门店群推送（主推送不受影响）。
+
 ### 关闭与验证
-- 关闭单次推送：`pull` / `import` 加 `--no-notify`。
+- 关闭所有推送：`pull` / `import` 加 `--no-notify`。
+- 仅关闭门店群推送：`pull` / `import` 加 `--no-store-notify`（主推送不受影响）。
 - 本地验证推送内容（不真实发送）：`process_notifications(orders, path, dry_run=True)`
   会打印将发送的文本而不发请求；`python -m unittest tests.test_notify` 覆盖
   格式化、缺失配置等行为（默认不去重，每次抓到都推）。

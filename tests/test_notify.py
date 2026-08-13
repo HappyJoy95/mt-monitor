@@ -1,6 +1,8 @@
+import json
 import os
 import shutil
 import unittest
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -123,6 +125,126 @@ class EnvVarTest(unittest.TestCase):
                     )
             self.assertEqual((pushed, skipped), (1, 0))
             self.assertEqual(m.call_count, 1)
+
+
+class StoreWebhookTest(unittest.TestCase):
+    """Tests for per-store webhook routing."""
+
+    def setUp(self):
+        self.tmp = Path(__file__).resolve().parent / "_tmp_notify_store"
+        self.tmp.mkdir(exist_ok=True)
+        (self.tmp / "config").mkdir(exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_store_push_during_business_hours(self):
+        """Order should be pushed to store webhook during business hours."""
+        store_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=STORE123"
+        self.tmp.joinpath("config", "store_webhooks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "门店名": "测试门店",
+                        "营业开始时间": "00:00:00",
+                        "营业结束时间": "23:59:59",
+                        "webhook": store_url,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        orders = [{"order_id": "O1", "status": "待接单", "store": "测试门店"}]
+        with mock.patch.object(
+            WechatWebhookClient, "send_text", return_value=None
+        ) as m:
+            pushed, skipped = notify.process_notifications(
+                orders, Path("/nonexistent/notify"), root=self.tmp
+            )
+        self.assertEqual(pushed, 1)
+        self.assertEqual(m.call_count, 1)
+
+    def test_store_push_skipped_outside_business_hours(self):
+        """Order should NOT be pushed to store webhook outside business hours."""
+        store_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=STORE123"
+        self.tmp.joinpath("config", "store_webhooks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "门店名": "测试门店",
+                        "营业开始时间": "01:00:00",
+                        "营业结束时间": "02:00:00",
+                        "webhook": store_url,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        orders = [{"order_id": "O1", "status": "待接单", "store": "测试门店"}]
+        with mock.patch.object(
+            WechatWebhookClient, "send_text", return_value=None
+        ) as m:
+            pushed, skipped = notify.process_notifications(
+                orders, Path("/nonexistent/notify"), root=self.tmp
+            )
+        self.assertEqual(pushed, 0)
+        self.assertEqual(m.call_count, 0)
+
+    def test_unmapped_store_skips_store_push(self):
+        """Order for a store not in the mapping should only try default webhook."""
+        orders = [{"order_id": "O1", "status": "待接单", "store": "未映射门店"}]
+        with mock.patch.object(
+            WechatWebhookClient, "send_text", return_value=None
+        ) as m:
+            pushed, skipped = notify.process_notifications(
+                orders, Path("/nonexistent/notify"), root=self.tmp
+            )
+        self.assertEqual(pushed, 0)
+        self.assertEqual(m.call_count, 0)
+
+    def test_default_and_store_both_push(self):
+        """With both default and store webhooks, both should be called."""
+        default_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=DEFAULT"
+        store_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=STORE123"
+        self.tmp.joinpath("config", "notify").write_text(default_url, encoding="utf-8")
+        self.tmp.joinpath("config", "store_webhooks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "门店名": "测试门店",
+                        "营业开始时间": "00:00:00",
+                        "营业结束时间": "23:59:59",
+                        "webhook": store_url,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        orders = [{"order_id": "O1", "status": "待接单", "store": "测试门店"}]
+        with mock.patch.object(
+            WechatWebhookClient, "send_text", return_value=None
+        ) as m:
+            pushed, skipped = notify.process_notifications(
+                orders, self.tmp / "config" / "notify", root=self.tmp
+            )
+        self.assertEqual(pushed, 1)
+        self.assertEqual(m.call_count, 2)
+
+
+class MidnightCrossingTest(unittest.TestCase):
+    """Tests for business hours that cross midnight."""
+
+    def test_crossing_midnight_in_range(self):
+        with mock.patch("src.mt_monitor.notify.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 23, 0, 0)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            self.assertTrue(notify._is_within_business_hours("22:00:00", "06:00:00"))
+
+    def test_crossing_midnight_out_range(self):
+        with mock.patch("src.mt_monitor.notify.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 1, 12, 0, 0)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            self.assertFalse(notify._is_within_business_hours("22:00:00", "06:00:00"))
 
 
 if __name__ == "__main__":

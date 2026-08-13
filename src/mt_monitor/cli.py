@@ -25,7 +25,7 @@ def _default_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _push(root: Path, orders) -> None:
+def _push(root: Path, orders, store_notify: bool = True) -> None:
     """Best-effort Enterprise WeChat push; never raises on missing deps/config."""
     if not orders:
         return
@@ -35,12 +35,14 @@ def _push(root: Path, orders) -> None:
         print(f"⚠️ 推送依赖缺失（需 requests），跳过推送：{exc}", file=sys.stderr)
         return
     pushed, skipped = notify.process_notifications(
-        orders, Path(root) / WEBHOOK_FILE, root=root
+        orders, Path(root) / WEBHOOK_FILE, root=root, store_notify=store_notify
     )
     print(f"企业微信推送：成功 {pushed} 笔")
 
 
-def cmd_import(root: Path, source: str, no_notify: bool = False) -> int:
+def cmd_import(
+    root: Path, source: str, no_notify: bool = False, no_store_notify: bool = False
+) -> int:
     source_path = Path(source)
     try:
         payload = json.loads(source_path.read_text(encoding="utf-8"))
@@ -61,11 +63,17 @@ def cmd_import(root: Path, source: str, no_notify: bool = False) -> int:
     print(f"原始数据：{raw_path}")
     print(f"订单摘要：{summary_path}（{len(summary)} 笔）")
     if not no_notify:
-        _push(root, summary)
+        _push(root, summary, store_notify=not no_store_notify)
     return 0
 
 
-def cmd_pull(root: Path, cdp_url: str, timeout: int, no_notify: bool = False) -> int:
+def cmd_pull(
+    root: Path,
+    cdp_url: str,
+    timeout: int,
+    no_notify: bool = False,
+    no_store_notify: bool = False,
+) -> int:
     # Detect the CDP dependency at the CLI layer so a missing ``playwright``
     # yields a clear install hint instead of the generic
     # "拉取失败：No module named 'playwright'".
@@ -112,7 +120,7 @@ def cmd_pull(root: Path, cdp_url: str, timeout: int, no_notify: bool = False) ->
     print(f"原始数据：{raw_path}")
     print(f"订单摘要：{summary_path}（{count} 笔）")
     if not no_notify:
-        _push(root, orders)
+        _push(root, orders, store_notify=not no_store_notify)
     return 0
 
 
@@ -130,6 +138,11 @@ def main(argv=None) -> int:
     p_import.add_argument(
         "--no-notify", action="store_true", help="跳过企业微信推送"
     )
+    p_import.add_argument(
+        "--no-store-notify",
+        action="store_true",
+        help="跳过门店群推送（主推送不受影响）",
+    )
 
     p_pull = sub.add_parser("pull", help="通过本机已登录浏览器实时拉取待接单")
     p_pull.add_argument(
@@ -146,14 +159,21 @@ def main(argv=None) -> int:
     p_pull.add_argument(
         "--no-notify", action="store_true", help="跳过企业微信推送"
     )
+    p_pull.add_argument(
+        "--no-store-notify",
+        action="store_true",
+        help="跳过门店群推送（主推送不受影响）",
+    )
 
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else _default_root()
 
     if args.command == "import":
-        return cmd_import(root, args.source, args.no_notify)
+        return cmd_import(root, args.source, args.no_notify, args.no_store_notify)
     if args.command == "pull":
-        return cmd_pull(root, args.cdp, args.timeout, args.no_notify)
+        return cmd_pull(
+            root, args.cdp, args.timeout, args.no_notify, args.no_store_notify
+        )
 
     parser.error("未知命令")
     return 2

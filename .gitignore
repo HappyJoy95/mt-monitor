@@ -1,4 +1,5 @@
 config/notify
+config/store_webhooks.json
 raw/
 data/
 .DS_Store

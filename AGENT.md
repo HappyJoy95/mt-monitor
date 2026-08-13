@@ -77,4 +77,4 @@
 - 已有提交：`9e47fd9`（设计/计划）、`242c789`（解析）、`e171ff4`（归档）、`bad43d7`（归档可读性测试）。
 - `tests/test_cli.py` 是未提交草稿。
 - `.DS_Store` 文件未跟踪，应保持忽略。
-- 不要提交 `config/notify`、`raw/`、`data/`。
+- 不要提交 `config/notify`、`config/store_webhooks.json`、`raw/`、`data/`。
