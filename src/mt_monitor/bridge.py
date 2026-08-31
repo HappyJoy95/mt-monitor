@@ -33,9 +33,9 @@ from .storage import save_raw, save_summary
 
 ORDER_LIST_PATH = "/order/list/page/unprocessed"
 ORDER_PAGE_MARKERS = ("shangoue.meituan.com", "orderbusiness")
-# Only the "待接单" (pending) tab is monitored; the opposite tab is clicked
-# first purely to guarantee a fresh list request (see pull_order_list).
-TAB_LABEL = "待接单"
+# Tabs to monitor - click each to capture its order list
+TAB_LABELS = ["待接单", "待发起配送"]
+# Used to force a fresh request by switching away first
 OPPOSITE_TAB_LABEL = "进行中"
 
 
@@ -97,8 +97,8 @@ def pull_order_list(
     cdp_url: str = "http://127.0.0.1:9222",
     timeout: int = 30,
 ):
-    """Connect to the local browser, capture the "待接单" (pending) order-list
-    response and archive it under ``raw/`` plus ``data/latest-new-orders.json``.
+    """Connect to the local browser, capture order-list responses for each
+    monitored tab ("待接单" / "待发起配送") and archive them.
 
     The live ``mtgsig`` signature is produced by the browser itself, so no saved
     request template or auth file is needed — we only reuse the browser's
@@ -128,57 +128,54 @@ def pull_order_list(
             # document, so all clicks and response waits must target that frame.
             frame = page.frame(name="hashframe") or page
 
-            label = TAB_LABEL
-            opposite_label = OPPOSITE_TAB_LABEL
             # Match the list endpoint exactly; the count/interval endpoints also
             # live under /order/list/ but carry no orderList.
             pred = (
                 lambda r: getattr(r.request, "method", "") == "POST"
                 and ORDER_LIST_PATH in (r.url or "")
             )
-            # The SPA only refetches the order list when its tab is (re)selected,
-            # and re-clicking an *already active* tab is a no-op (no request).
-            # To guarantee a fresh request for `label`, first switch to the
-            # opposite tab — its response is captured and discarded — then switch
-            # back to `label`, whose response we keep. If the page is already on
-            # the opposite tab, the first click is a no-op and times out, which
-            # is harmless.
-            try:
-                with page.expect_response(pred, timeout=timeout * 1000):
-                    _click_tab(frame, opposite_label)
-                page.wait_for_timeout(1500)
-            except Exception:
-                pass
-            try:
-                with page.expect_response(pred, timeout=timeout * 1000) as info:
-                    _click_tab(frame, label)
-                response = info.value
-            except Exception as exc:
-                if "Timeout" in type(exc).__name__:
-                    raise RuntimeError(
-                        "超时未捕获到订单列表接口响应。若页面已掉登录或列表未加载，"
-                        "请在 Edge 中刷新/重新登录后重试。"
-                    )
-                raise
 
-            payload = _read_payload(response)
-            if payload is None:
-                raise RuntimeError("捕获到的响应无法解析为 JSON，请重试。")
+            all_payloads = []
+            for label in TAB_LABELS:
+                # The SPA only refetches the order list when its tab is (re)selected,
+                # and re-clicking an *already active* tab is a no-op (no request).
+                # To guarantee a fresh request, first switch to the opposite tab,
+                # then switch back to the target tab.
+                try:
+                    with page.expect_response(pred, timeout=timeout * 1000):
+                        _click_tab(frame, OPPOSITE_TAB_LABEL)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+                try:
+                    with page.expect_response(pred, timeout=timeout * 1000) as info:
+                        _click_tab(frame, label)
+                    response = info.value
+                    payload = _read_payload(response)
+                    if payload is not None:
+                        data = payload.get("data")
+                        if isinstance(data, dict) and "orderList" in data:
+                            all_payloads.append((label, payload))
+                except Exception:
+                    pass  # Skip this tab if timeout
 
-            data = payload.get("data")
-            if not isinstance(data, dict) or "orderList" not in data:
+            if not all_payloads:
                 raise RuntimeError(
-                    f"接口响应未包含订单列表（code={payload.get('code')}，"
-                    "可能已掉登录或返回错误页）。请在 Edge 中刷新/重新登录后重试。"
+                    "超时未捕获到任何订单列表接口响应。若页面已掉登录或列表未加载，"
+                    "请在 Edge 中刷新/重新登录后重试。"
                 )
 
-            # Archive the raw response first, unconditionally — a later summary
-            # failure must never cost us the original data. The summary is then
-            # generated best-effort (a malformed order is skipped, not fatal).
-            raw_path = save_raw(Path(root), payload)
-            summary = summarize_orders(payload)
-            summary_path = save_summary(Path(root), summary, kind="new")
-            return raw_path, summary_path
+            # Archive all responses and combine summaries
+            combined_summary = []
+            last_raw_path = None
+            for label, payload in all_payloads:
+                raw_path = save_raw(Path(root), payload)
+                last_raw_path = raw_path
+                summary = summarize_orders(payload)
+                combined_summary.extend(summary)
+
+            summary_path = save_summary(Path(root), combined_summary, kind="new")
+            return last_raw_path, summary_path
         # 注意：connect_over_cdp 连接的是用户自己的浏览器，绝不能调用
         # browser.close()，否则会关闭用户正在使用的 Edge。依赖
         # sync_playwright 上下文退出时自动断开连接即可，不主动关闭。
