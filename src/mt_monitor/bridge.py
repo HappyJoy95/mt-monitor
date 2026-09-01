@@ -137,16 +137,14 @@ def pull_order_list(
 
             all_payloads = []
             for label in TAB_LABELS:
-                # The SPA only refetches the order list when its tab is (re)selected,
-                # and re-clicking an *already active* tab is a no-op (no request).
-                # To guarantee a fresh request, first switch to the opposite tab,
-                # then switch back to the target tab.
+                # Click the opposite tab first to ensure we can re-trigger the target tab
                 try:
-                    with page.expect_response(pred, timeout=timeout * 1000):
-                        _click_tab(frame, OPPOSITE_TAB_LABEL)
+                    _click_tab(frame, OPPOSITE_TAB_LABEL)
                     page.wait_for_timeout(1500)
                 except Exception:
                     pass
+
+                # Now click the target tab and capture its response
                 try:
                     with page.expect_response(pred, timeout=timeout * 1000) as info:
                         _click_tab(frame, label)
