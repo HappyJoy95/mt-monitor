@@ -33,10 +33,8 @@ from .storage import save_raw, save_summary
 
 ORDER_LIST_PATH = "/order/list/page/unprocessed"
 ORDER_PAGE_MARKERS = ("shangoue.meituan.com", "orderbusiness")
-# Tabs to monitor - click each to capture its order list
-TAB_LABELS = ["待接单", "待发起配送"]
-# Used to force a fresh request by switching away first
-OPPOSITE_TAB_LABEL = "进行中"
+# Click "进行中" tab to get all orders, then filter by status
+TARGET_TAB = "进行中"
 
 
 def _find_order_page(browser):
@@ -135,45 +133,35 @@ def pull_order_list(
                 and ORDER_LIST_PATH in (r.url or "")
             )
 
-            all_payloads = []
-            for label in TAB_LABELS:
-                # Click the opposite tab first to ensure we can re-trigger the target tab
-                try:
-                    _click_tab(frame, OPPOSITE_TAB_LABEL)
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
+            # Click "进行中" tab to get all orders
+            try:
+                with page.expect_response(pred, timeout=timeout * 1000) as info:
+                    _click_tab(frame, TARGET_TAB)
+                response = info.value
+            except Exception as exc:
+                if "Timeout" in type(exc).__name__:
+                    raise RuntimeError(
+                        "超时未捕获到订单列表接口响应。若页面已掉登录或列表未加载，"
+                        "请在 Edge 中刷新/重新登录后重试。"
+                    )
+                raise
 
-                # Now click the target tab and capture its response
-                try:
-                    with page.expect_response(pred, timeout=timeout * 1000) as info:
-                        _click_tab(frame, label)
-                    response = info.value
-                    payload = _read_payload(response)
-                    if payload is not None:
-                        data = payload.get("data")
-                        if isinstance(data, dict) and "orderList" in data:
-                            all_payloads.append((label, payload))
-                except Exception:
-                    pass  # Skip this tab if timeout
+            payload = _read_payload(response)
+            if payload is None:
+                raise RuntimeError("捕获到的响应无法解析为 JSON，请重试。")
 
-            if not all_payloads:
+            data = payload.get("data")
+            if not isinstance(data, dict) or "orderList" not in data:
                 raise RuntimeError(
-                    "超时未捕获到任何订单列表接口响应。若页面已掉登录或列表未加载，"
-                    "请在 Edge 中刷新/重新登录后重试。"
+                    f"接口响应未包含订单列表（code={payload.get('code')}，"
+                    "可能已掉登录或返回错误页）。请在 Edge 中刷新/重新登录后重试。"
                 )
 
-            # Archive all responses and combine summaries
-            combined_summary = []
-            last_raw_path = None
-            for label, payload in all_payloads:
-                raw_path = save_raw(Path(root), payload)
-                last_raw_path = raw_path
-                summary = summarize_orders(payload)
-                combined_summary.extend(summary)
-
-            summary_path = save_summary(Path(root), combined_summary, kind="new")
-            return last_raw_path, summary_path
+            # Archive the raw response and generate summary
+            raw_path = save_raw(Path(root), payload)
+            summary = summarize_orders(payload)
+            summary_path = save_summary(Path(root), summary, kind="new")
+            return raw_path, summary_path
         # 注意：connect_over_cdp 连接的是用户自己的浏览器，绝不能调用
         # browser.close()，否则会关闭用户正在使用的 Edge。依赖
         # sync_playwright 上下文退出时自动断开连接即可，不主动关闭。
