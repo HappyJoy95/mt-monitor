@@ -7,3 +7,6 @@ logs/
 .DS_Store
 __pycache__/
 .workbuddy/
+
+# DSH 隔离区：记忆/临时任务/归档/备份/文档，在库里但不进版本库
+.dsh/

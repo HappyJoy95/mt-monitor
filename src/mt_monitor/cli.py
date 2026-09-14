@@ -4,10 +4,11 @@ Sub-commands:
   import  Read a saved order-list JSON response from disk and archive it.
   pull    Connect to a locally logged-in browser and capture a live response.
   audit   Compare the scheduled window against raw/ captures and the run log.
+  watch   Pull on a fixed interval, self-healing and alerting on failures.
 
-``import`` needs only the standard library. ``pull`` lazily imports the CDP
-bridge (which requires ``playwright``) and the push layer (which requires
-``requests``) so the rest of the tool stays usable without those deps.
+``import`` needs only the standard library. ``pull`` / ``watch`` lazily import
+the CDP bridge (which requires ``playwright``) and the push layer (which
+requires ``requests``) so the rest of the tool stays usable without those deps.
 """
 from __future__ import annotations
 
@@ -97,6 +98,7 @@ def cmd_pull(
     timeout: int,
     no_notify: bool = False,
     no_store_notify: bool = False,
+    retries: int = 2,
 ) -> int:
     # Detect the CDP dependency at the CLI layer so a missing ``playwright``
     # yields a clear install hint instead of the generic
@@ -120,12 +122,22 @@ def cmd_pull(
     # `pull` connects to the user's live, logged-in browser via CDP and reuses
     # its session, so no saved request template or auth file is required (the
     # dynamic mtgsig is produced by the browser, not read from disk).
+    #
+    # `retries` is the number of extra attempts after a *retryable* failure
+    # (stuck/blank page); each retry recovers the page first (reload -> hard
+    # reload -> re-navigate) and then waits until it is genuinely ready again.
     try:
         raw_path, summary_path = bridge.pull_order_list(
-            root, cdp_url=cdp_url, timeout=timeout
+            root,
+            cdp_url=cdp_url,
+            timeout=timeout,
+            max_attempts=max(1, retries + 1),
+            on_event=lambda message: print(f"⚠️ {message}", file=sys.stderr),
         )
     except ImportError:
-        # Belt-and-suspenders in case playwright is missing deeper down.
+        # Belt-and-suspenders in case playwright is missing deeper down. The
+        # cost is that the bridge's retry wrapper turns a deep ImportError into
+        # a BridgeError, so check the cause chain too (see bridge.pull_order_list).
         print(
             "缺少依赖 playwright，请先安装：pip install playwright\n"
             "（无需 playwright install chromium，因为连接的是本机已运行的浏览器）",
@@ -133,6 +145,16 @@ def cmd_pull(
         )
         return 3
     except Exception as exc:  # bridge raises user-facing messages
+        if any(
+            isinstance(cause, ImportError)
+            for cause in (exc, getattr(exc, "__cause__", None))
+        ):
+            print(
+                "缺少依赖 playwright，请先安装：pip install playwright\n"
+                "（无需 playwright install chromium，因为连接的是本机已运行的浏览器）",
+                file=sys.stderr,
+            )
+            return 3
         print(f"拉取失败：{exc}", file=sys.stderr)
         return 1
 
@@ -145,6 +167,91 @@ def cmd_pull(
     print(f"订单摘要：{summary_path}（{count} 笔）")
     if not no_notify:
         _push(root, orders, store_notify=not no_store_notify)
+    return 0
+
+
+def _load_pull_dependencies():
+    """Import playwright + bridge for `watch`, or return ``None`` on failure."""
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401
+    except ImportError:
+        print(
+            "缺少依赖 playwright，请先安装：pip install playwright\n"
+            "（无需 playwright install chromium，因为连接的是本机已运行的浏览器）",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        from . import bridge
+    except ImportError as exc:
+        print(f"⚠️ 桥接模块加载失败：{exc}", file=sys.stderr)
+        return None
+    return bridge
+
+
+def cmd_watch(
+    root: Path,
+    cdp_url: str,
+    timeout: int,
+    interval: int,
+    max_failures: int,
+    alert_after: int,
+    retries: int,
+    no_notify: bool = False,
+    no_store_notify: bool = False,
+    once: bool = False,
+) -> int:
+    """Unattended loop: pull every ``interval`` seconds, self-healing per pull.
+
+    The loop keeps running through individual failures; only ``max_failures``
+    *consecutive* failures stop it (0 = never stop), which is what a supervisor
+    or an on-call human needs in order to intervene.
+    """
+    bridge = _load_pull_dependencies()
+    if bridge is None:
+        return 3
+    try:
+        from . import watch as watch_mod
+    except ImportError as exc:
+        print(f"⚠️ 守护模块加载失败：{exc}", file=sys.stderr)
+        return 3
+
+    def pull_fn():
+        return bridge.pull_order_list(
+            root,
+            cdp_url=cdp_url,
+            timeout=timeout,
+            max_attempts=max(1, retries + 1),
+            on_event=watch_mod.log,
+        )
+
+    def notify_fn(summary_path):
+        try:
+            orders = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+        except Exception:
+            orders = []
+        _push(root, orders, store_notify=not no_store_notify)
+
+    alert_fn = None
+    if alert_after:
+        try:
+            alert_fn = watch_mod.make_webhook_alerter(root, WEBHOOK_FILE)
+        except ImportError as exc:
+            print(f"⚠️ 告警依赖缺失（需 requests），已关闭告警：{exc}", file=sys.stderr)
+
+    state = watch_mod.run_forever(
+        pull_fn,
+        interval=interval,
+        max_failures=max_failures,
+        alert_after=alert_after,
+        notify_fn=None if no_notify else notify_fn,
+        alert_fn=alert_fn,
+        once=once,
+    )
+    print(watch_mod.summarise(state))
+    # A watch that exited because failures piled up must not look like success.
+    if max_failures and state.consecutive_failures >= max_failures:
+        return 1
     return 0
 
 
@@ -178,6 +285,12 @@ def main(argv=None) -> int:
         "--timeout", type=int, default=30, help="捕获订单响应的超时秒数"
     )
     p_pull.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="页面卡死时的刷新重试次数（默认 2，每次重试前自动刷新页面）",
+    )
+    p_pull.add_argument(
         "--root", default=None, help="项目根目录（默认自动推断）"
     )
     p_pull.add_argument(
@@ -195,6 +308,55 @@ def main(argv=None) -> int:
     p_audit.add_argument("--date", default=None, help="日期 YYYY-MM-DD，默认今天")
     p_audit.add_argument("--root", default=None, help="项目根目录（默认自动推断）")
 
+    p_watch = sub.add_parser(
+        "watch", help="常驻守护：定时拉取，页面卡死自动刷新重试，连续失败告警"
+    )
+    p_watch.add_argument(
+        "--interval", type=int, default=60, help="两次拉取的间隔秒数（默认 60）"
+    )
+    p_watch.add_argument(
+        "--cdp",
+        default="http://127.0.0.1:9222",
+        help="本机浏览器 CDP 调试地址",
+    )
+    p_watch.add_argument(
+        "--timeout", type=int, default=30, help="捕获订单响应的超时秒数"
+    )
+    p_watch.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="每轮拉取内部的自愈重试次数（默认 2）",
+    )
+    p_watch.add_argument(
+        "--max-failures",
+        type=int,
+        default=0,
+        help="连续失败多少次后退出（默认 0 = 永不退出，一直守着）",
+    )
+    p_watch.add_argument(
+        "--alert-after",
+        type=int,
+        default=3,
+        help="连续失败多少次后推送企微告警（默认 3，0 = 关闭告警）",
+    )
+    p_watch.add_argument(
+        "--once",
+        action="store_true",
+        help="只跑一轮就退出（用于自检/launchd 定时拉起）",
+    )
+    p_watch.add_argument(
+        "--root", default=None, help="项目根目录（默认自动推断）"
+    )
+    p_watch.add_argument(
+        "--no-notify", action="store_true", help="跳过企业微信推送"
+    )
+    p_watch.add_argument(
+        "--no-store-notify",
+        action="store_true",
+        help="跳过门店群推送（主推送不受影响）",
+    )
+
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else _default_root()
 
@@ -202,7 +364,25 @@ def main(argv=None) -> int:
         return cmd_import(root, args.source, args.no_notify, args.no_store_notify)
     if args.command == "pull":
         return cmd_pull(
-            root, args.cdp, args.timeout, args.no_notify, args.no_store_notify
+            root,
+            args.cdp,
+            args.timeout,
+            args.no_notify,
+            args.no_store_notify,
+            retries=args.retries,
+        )
+    if args.command == "watch":
+        return cmd_watch(
+            root,
+            args.cdp,
+            args.timeout,
+            args.interval,
+            args.max_failures,
+            args.alert_after,
+            args.retries,
+            no_notify=args.no_notify,
+            no_store_notify=args.no_store_notify,
+            once=args.once,
         )
     if args.command == "audit":
         return cmd_audit(root, args.date)
