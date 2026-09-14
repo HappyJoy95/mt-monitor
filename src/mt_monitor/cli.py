@@ -3,6 +3,7 @@
 Sub-commands:
   import  Read a saved order-list JSON response from disk and archive it.
   pull    Connect to a locally logged-in browser and capture a live response.
+  audit   Compare the scheduled window against raw/ captures and the run log.
 
 ``import`` needs only the standard library. ``pull`` lazily imports the CDP
 bridge (which requires ``playwright``) and the push layer (which requires
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 from .normalize import summarize_orders
@@ -65,6 +67,28 @@ def cmd_import(
     if not no_notify:
         _push(root, summary, store_notify=not no_store_notify)
     return 0
+
+
+def cmd_audit(root: Path, day: str | None = None) -> int:
+    """Report minutes within the monitoring window that produced no capture.
+
+    Cross-references ``raw/`` (one file per successful capture) with
+    ``logs/pull-YYYY-MM-DD.log`` (one start/end line per scheduled run) so a
+    missing minute can be traced to "task never fired", "run failed" (with the
+    printed reason) or "run still in flight".
+    """
+    from .report import audit, format_report
+
+    target = None
+    if day:
+        try:
+            target = date.fromisoformat(day)
+        except ValueError:
+            print(f"日期格式无效（需要 YYYY-MM-DD）：{day}", file=sys.stderr)
+            return 2
+    report = audit(root, target)
+    print(format_report(report))
+    return 0 if report.ok else 1
 
 
 def cmd_pull(
@@ -165,6 +189,12 @@ def main(argv=None) -> int:
         help="跳过门店群推送（主推送不受影响）",
     )
 
+    p_audit = sub.add_parser(
+        "audit", help="核对每分钟抓取是否都执行（对照 logs/pull-*.log 定位原因）"
+    )
+    p_audit.add_argument("--date", default=None, help="日期 YYYY-MM-DD，默认今天")
+    p_audit.add_argument("--root", default=None, help="项目根目录（默认自动推断）")
+
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else _default_root()
 
@@ -174,6 +204,8 @@ def main(argv=None) -> int:
         return cmd_pull(
             root, args.cdp, args.timeout, args.no_notify, args.no_store_notify
         )
+    if args.command == "audit":
+        return cmd_audit(root, args.date)
 
     parser.error("未知命令")
     return 2

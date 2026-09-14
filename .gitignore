@@ -2,6 +2,8 @@ config/notify
 config/store_webhooks.json
 raw/
 data/
+logs/
+.venv/
 .DS_Store
 __pycache__/
 .workbuddy/
