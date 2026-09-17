@@ -13,7 +13,7 @@
 ## 功能概述
 
 1. **订单采集**：通过 CDP 桥接本地已登录浏览器，点「进行中」标签捕获全状态订单列表，
-   再由 `normalize` 过滤出「待接单」+「待发起配送」（后者需进入拣货完成前 3 分钟窗口）
+   再由 `normalize` 过滤出「待接单」+「待发起配送」（后者需进入拣货完成前 6 分钟窗口）
 2. **主推送**：所有订单推送到主企业微信群（`config/notify` 或 `QYWECHAT_WEBHOOK` 环境变量）
 3. **门店推送**：按门店名精确匹配，推送到对应门店群（`config/store_webhooks.json`）
 
@@ -120,7 +120,8 @@ complete + `hashframe` iframe 挂上 + 目标标签可点）再重新点标签�
 
 `bridge.TARGET_TAB = "进行中"`（该列表含各状态订单），实际监控哪些状态由
 `normalize.VALID_STATUSES = {"待接单", "待发起配送"}` 决定；「待发起配送」还要满足
-`canClickButtonTime - 3 分钟` 才推送。`tests/test_bridge.py::TabStrategyTests` 把这个
+`canClickButtonTime - 6 分钟`（`PICK_READY_OFFSET_MINUTES`，2026-09-17 由 3 分钟调大）
+才推送。`tests/test_bridge.py::TabStrategyTests` 把这个
 约定钉住了——改 `TARGET_TAB` 会静默缩小监控范围，别当成实现细节随手改。
 
 ### 定位逻辑的三个硬约束（真机实测，别再踩）

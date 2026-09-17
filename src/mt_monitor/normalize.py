@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 # Only these order statuses should be summarized and pushed
 VALID_STATUSES = {"待接单", "待发起配送"}
 
-# For "待发起配送" orders, only push when current time >= canClickButtonTime - 3 minutes
-PICK_READY_OFFSET_MINUTES = 3
+# For "待发起配送" orders, only push when current time >= canClickButtonTime - N
+# minutes. 6 minutes (raised from 3 on 2026-09-17) deliberately gives the store
+# more lead time before the 拣货完成 button becomes clickable.
+PICK_READY_OFFSET_MINUTES = 6
 
 
 def _get_pick_ready_time(order):
@@ -72,7 +74,8 @@ def summarize_orders(payload):
     """Best-effort summary of every order in ``payload``.
 
     Only orders with status "待接单" or "待发起配送" are included.
-    For "待发起配送" orders, only push when current time >= canClickButtonTime - 3 minutes.
+    For "待发起配送" orders, only push when current time >= canClickButtonTime
+    minus ``PICK_READY_OFFSET_MINUTES`` (6) minutes.
     A single malformed order (missing field, broken nested JSON, unexpected
     shape) is skipped with a warning printed to stderr — it never aborts the
     whole collection. The raw response is archived separately, so even if every
