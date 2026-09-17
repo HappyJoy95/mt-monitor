@@ -153,6 +153,46 @@ python -m src.mt_monitor.cli watch --retries 3          # 每轮内部刷新重�
 
 `watch` 与 `pull` 退出码：`0` 正常；`1` 拉取失败或失败达上限；`3` 缺依赖。
 
+### 浏览器看门狗（`edge-watch`）
+
+上面那套自愈只能救**页面**。如果**浏览器进程本身假死**——9222 端口还在监听、但 CDP
+握手一直超时——每轮 `pull` 都会卡在第一步就失败，自愈阶梯根本没机会执行。
+2026-09-16 本机就这样丢了约 12 小时监控（182 轮全部 `connect_over_cdp: Timeout
+180000ms exceeded`，20:38 才自行恢复）。
+
+`edge-watch` 定期探测 CDP，连续 N 次失败后**只重启监控专用 profile 的 Edge 实例**
+（按 `--user-data-dir` 精确匹配进程，绝不碰你正常浏览的 Edge），并推一条企微告警：
+
+```bash
+python -m src.mt_monitor.cli edge-watch                 # 探测一次（健康时秒回）
+python -m src.mt_monitor.cli edge-watch --threshold 3   # 连续 3 次失败才重启（默认）
+python -m src.mt_monitor.cli edge-watch --no-alert      # 只重启不告警
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--cdp` | `http://127.0.0.1:9222` | CDP 地址；端口也用于重启时拉起浏览器 |
+| `--profile-dir` | `C:\tmp\mt-monitor-edge` | 只重启用该 user-data-dir 的实例 |
+| `--edge-exe` | 自动探测 | Edge 可执行文件路径 |
+| `--threshold` | 3 | 连续探测失败多少次后重启 |
+| `--probe-timeout` | 5 | 单次探测超时秒数（假死的浏览器会接受 TCP 但不回包，必须短超时） |
+| `--startup-timeout` | 60 | 重启后等待 CDP 就绪的秒数 |
+| `--no-alert` | — | 重启后不推企微告警 |
+
+行为约定：
+
+- 计数存在 `data/edge_watch_state.json`，所以 `--threshold` 的含义是"**连续 N 次检查**"
+  而不是"一个进程内探测 N 次"。
+- 探测恢复正常即清零；**重启尝试过也清零**，把重试间隔摊到阈值周期上，
+  避免浏览器一旦起不来就每轮都被杀掉重启。
+- 退出码：`0` 正常（含"正在计数"）；`1` 已重启但 CDP 仍没起来（交给计划任务/人工介入）。
+- 本机计划任务 `MT Edge Watch`：08:25–22:05（比拉取窗口 08:30–22:00 略宽）、每 5 分钟一次，
+  输出到 `logs/edge-watch-YYYY-MM-DD.log`。
+- 若重启后 Edge 掉登录，`pull` 会明确报"跳登录页/请重新登录"，需人工扫码一次。
+- 验证重启路径不必动生产浏览器：用一次性 profile 与端口演练即可，例如
+  `edge-watch --cdp http://127.0.0.1:9333 --profile-dir C:\tmp\mt-edge-selftest --threshold 1`
+  （探测 9333 失败 → 杀掉该 profile 的进程 → 重新拉起 → 校验 CDP 就绪）。
+
 ## 运行测试
 
 ```bash

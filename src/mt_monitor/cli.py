@@ -255,6 +255,51 @@ def cmd_watch(
     return 0
 
 
+def cmd_edge_watch(
+    cdp_url: str,
+    profile_dir: str,
+    edge_exe: str,
+    threshold: int,
+    probe_timeout: float,
+    startup_timeout: float,
+    root: Path,
+    no_alert: bool = False,
+) -> int:
+    """Probe CDP; after ``threshold`` consecutive failures restart the monitor Edge.
+
+    Complements the per-page self-healing in ``bridge``: a *wedged browser
+    process* keeps port 9222 listening while every CDP handshake times out, so
+    no pull can succeed until someone restarts the browser. This check runs on a
+    schedule, restarts only the Edge instance bound to the monitor's own
+    profile, and alerts the main WeChat group.
+    """
+    from . import edge_watch as ew
+
+    alert_fn = None
+    if not no_alert:
+        try:
+            from .watch import make_webhook_alerter
+
+            alert_fn = make_webhook_alerter(root, WEBHOOK_FILE)
+        except ImportError as exc:
+            print(f"⚠️ 告警依赖缺失（需 requests），已关闭告警：{exc}", file=sys.stderr)
+
+    result = ew.run_check(
+        cdp_url=cdp_url,
+        profile_dir=profile_dir,
+        edge_exe=edge_exe or ew.find_edge_exe(),
+        state_path=Path(root) / ew.STATE_FILE,
+        threshold=threshold,
+        probe_timeout=probe_timeout,
+        startup_timeout=startup_timeout,
+        alert_fn=alert_fn,
+    )
+    # A restart that did not bring CDP back is a failure the supervisor should see.
+    if result.get("action") == "restarted" and not result.get("cdp_ready"):
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="mt-monitor", description="美团闪购商家端订单采集工具"
@@ -357,6 +402,48 @@ def main(argv=None) -> int:
         help="跳过门店群推送（主推送不受影响）",
     )
 
+    p_edge = sub.add_parser(
+        "edge-watch",
+        help="调试 Edge 看门狗：CDP 连续探测失败则自动重启浏览器并告警",
+    )
+    p_edge.add_argument(
+        "--cdp",
+        default="http://127.0.0.1:9222",
+        help="本机浏览器 CDP 调试地址",
+    )
+    p_edge.add_argument(
+        "--profile-dir",
+        default=r"C:\tmp\mt-monitor-edge",
+        help="监控专用 Edge 的 user-data-dir（只重启用它的实例）",
+    )
+    p_edge.add_argument(
+        "--edge-exe",
+        default="",
+        help="Edge 可执行文件路径（默认自动探测常见安装位置）",
+    )
+    p_edge.add_argument(
+        "--threshold",
+        type=int,
+        default=3,
+        help="连续探测失败多少次后重启浏览器（默认 3）",
+    )
+    p_edge.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=5.0,
+        help="单次 CDP 探测超时秒数（默认 5）",
+    )
+    p_edge.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=60.0,
+        help="重启后等待 CDP 就绪的秒数（默认 60）",
+    )
+    p_edge.add_argument(
+        "--no-alert", action="store_true", help="重启后不推送企微告警"
+    )
+    p_edge.add_argument("--root", default=None, help="项目根目录（默认自动推断）")
+
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else _default_root()
 
@@ -386,6 +473,17 @@ def main(argv=None) -> int:
         )
     if args.command == "audit":
         return cmd_audit(root, args.date)
+    if args.command == "edge-watch":
+        return cmd_edge_watch(
+            args.cdp,
+            args.profile_dir,
+            args.edge_exe,
+            args.threshold,
+            args.probe_timeout,
+            args.startup_timeout,
+            root,
+            no_alert=args.no_alert,
+        )
 
     parser.error("未知命令")
     return 2
