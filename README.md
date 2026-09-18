@@ -204,11 +204,18 @@ python -m unittest discover -s tests -v
 本机通过计划任务 `MT Monitor` 无人值守运行：每天 08:30 起、间隔 1 分钟、持续
 13h30m（即 08:30–22:00），动作是 `run_pull.cmd`。
 
-- `run_pull.cmd`：包装脚本，把每次运行写入 `logs/pull-YYYY-MM-DD.log`，每轮记录
-  开始时间与 `exit=` 退出码，便于事后判断"哪一分钟没执行/失败"。
-  **该文件必须保持 CRLF 换行**（cmd.exe 遇到 LF 换行会解析错乱），且保持纯 ASCII。
-- 计划任务的 `MultipleInstancesPolicy` 为 `Parallel`：单轮耗时可能超过 1 分钟
-  （推送较多订单时），`IgnoreNew` 会整分钟跳过，`Parallel` 则不会漏。
+- `run_pull.cmd`：只做「切目录 + 调 `python -m src.mt_monitor.cli pull-logged`」，
+  并把退出码原样返回给计划任务。**该文件必须保持 CRLF 换行**（cmd.exe 遇到 LF
+  换行会解析错乱），且保持纯 ASCII。
+- **日志由 Python 写，不用 cmd 的 `>>`**：`pull-logged` 在每轮前后把
+  `--- pull start ---` / `--- pull end (exit=N) ---` 及进程输出追加到
+  `logs/pull-YYYY-MM-DD.log`。原因是一次真实事故（2026-09-18 19:55）：cmd 的
+  `>>` 重定向不可共享，当有一轮还在跑（自愈最久可达 2 分钟）时，重叠轮次的
+  重定向打不开日志文件，于是整条 python 命令被跳过——那一分钟既没日志也没抓取，
+  而任务仍返回 0。Python 的追加模式允许并发写，重叠轮次现在都能正常记录。
+- 计划任务的 `MultipleInstancesPolicy` 为 `Parallel`：单轮可能超过 1 分钟，
+  `IgnoreNew` 会整分钟跳过，`Parallel` 则照常起新实例（已被实测验证：重叠轮次
+  都会各自落一份日志与抓取）。
   Windows 计划任务的重复间隔**最小为 1 分钟**，无法配置 30 秒。
 - `logs/` 已在 `.gitignore` 中排除。
 
@@ -242,6 +249,7 @@ python -m src.mt_monitor.cli audit --date 2026-09-14
 | 运行失败 | 该分钟有运行记录但退出码非 0，并引用进程打印的原因 |
 | 未运行 | 该分钟既无抓取也无运行记录 → 任务未触发（调度/机器状态） |
 | 上一轮仍在运行 | 该分钟被一个更早开始、尚未结束的轮次覆盖 |
+| 运行跨分钟 | 该轮确实成功，只是自愈耗时把抓取推过了分钟边界（附耗时与落点） |
 | 运行成功但无输出 | 退出码 0 却没落盘 → 查磁盘/权限 |
 | 运行中 | 该轮尚未结束（报告生成时仍在跑） |
 | 无日志记录 | 日志尚未启用（`run_pull.cmd` 部署前）或该日无日志，无法判定 |

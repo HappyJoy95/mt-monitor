@@ -11,6 +11,7 @@ from src.mt_monitor.report import (
     NO_OUTPUT,
     NO_RUN,
     RUNNING,
+    SLOW,
     audit,
     format_report,
     parse_raw_minutes,
@@ -209,6 +210,21 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(_kinds(report.gaps), [RUNNING, BLOCKED])
         self.assertEqual(report.failed_runs, [])
         self.assertIn("尚未结束", report.gaps[0].detail)
+
+    def test_run_spanning_the_minute_with_a_late_capture_is_slow_not_broken(self):
+        # 2026-09-18 19:54: the page was stuck, self-healing took 2m07s and the
+        # capture landed at 19:56 — "slow", not a disk/permission failure.
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _raw(root, "10-02-05")
+            _log(root, _run_block("10:00:30", "10:02:30", 0))
+
+            report = audit(root, DAY, now=NOW, window_start=WINDOW_START)
+
+        self.assertEqual(_minutes(report.gaps), ["10:00", "10:01"])
+        self.assertEqual(_kinds(report.gaps), [SLOW, BLOCKED])
+        self.assertIn("抓取落在 10:02", report.gaps[0].detail)
+        self.assertIn("耗时 120 秒", report.gaps[0].detail)
 
     def test_zero_exit_without_capture_is_flagged_as_no_output(self):
         with TemporaryDirectory() as directory:

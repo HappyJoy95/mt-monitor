@@ -45,6 +45,7 @@ RUNNING = "运行中"
 NO_OUTPUT = "运行成功但无输出"
 BLOCKED = "上一轮仍在运行"
 NO_LOG = "无日志记录"
+SLOW = "运行跨分钟"
 
 _DIAGNOSTIC_MARKERS = ("失败", "⚠️", "Error", "error", "Timeout", "Traceback")
 
@@ -175,6 +176,20 @@ def _classify(
         if run.exit_code is None:
             return Gap(minute, RUNNING, "该轮尚未结束（可能仍在抓取/推送）")
         if run.exit_code == 0:
+            # The run succeeded, just not inside this minute: a self-healed page
+            # can push the capture past the minute boundary, which is not the
+            # same as "wrote nothing" and must not be reported as a disk issue.
+            if run.end is not None:
+                first = run.start.replace(second=0, microsecond=0)
+                last = run.end.replace(second=0, microsecond=0)
+                landed = sorted(m for m in captured_minutes if first <= m <= last)
+                if landed:
+                    return Gap(
+                        minute,
+                        SLOW,
+                        f"该轮耗时 {int((run.end - run.start).total_seconds())} 秒，"
+                        f"抓取落在 {landed[0].strftime('%H:%M')}",
+                    )
             return Gap(minute, NO_OUTPUT, "退出码为 0 但没有落盘，需检查磁盘/权限")
         return Gap(minute, FAILED, f"exit={run.exit_code} {run.diagnostic()}".strip())
     spanning = [r for r in runs if r.start < minute and (r.end is None or r.end > minute)]

@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from .normalize import summarize_orders
@@ -168,6 +168,70 @@ def cmd_pull(
     if not no_notify:
         _push(root, orders, store_notify=not no_store_notify)
     return 0
+
+
+def run_logged(root: Path, run_fn, *, now_fn=None) -> int:
+    """Run ``run_fn`` and append a start/end block to ``logs/pull-YYYY-MM-DD.log``.
+
+    Logging lives here rather than in the ``.cmd`` wrapper on purpose: cmd's
+    ``>>`` redirection takes the file exclusively enough that a run overlapping
+    a long one could not open the shared log and silently did nothing (observed
+    2026-09-18 19:55:01 under the task's Parallel policy — the tick "ran",
+    returned 0 and left neither a log line nor a capture). Python's append mode
+    tolerates concurrent writers, so every overlapping attempt is recorded.
+
+    The captured output is echoed to the console as well, and the wrapped
+    function's exit code is returned unchanged so the scheduled task reports it.
+    """
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    now_fn = now_fn or datetime.now
+    logs_dir = Path(root) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    start = now_fn()
+    buffer = io.StringIO()
+    with redirect_stdout(buffer), redirect_stderr(buffer):
+        code = run_fn()
+    end = now_fn()
+
+    lines = [f"[{start:%Y-%m-%d %H:%M:%S}] --- pull start ---"]
+    output = buffer.getvalue().strip("\n")
+    if output:
+        lines.extend(output.splitlines())
+    lines.append(f"[{end:%Y-%m-%d %H:%M:%S}] --- pull end (exit={code}) ---")
+
+    log_path = logs_dir / f"pull-{start:%Y-%m-%d}.log"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+    if output:
+        print(output)
+    return code
+
+
+def cmd_pull_logged(
+    root: Path,
+    cdp_url: str,
+    timeout: int,
+    no_notify: bool = False,
+    no_store_notify: bool = False,
+    retries: int = 2,
+) -> int:
+    """``pull`` with the scheduled task's per-run log block (see run_logged)."""
+
+    def _run() -> int:
+        return cmd_pull(
+            root,
+            cdp_url,
+            timeout,
+            no_notify,
+            no_store_notify,
+            retries=retries,
+        )
+
+    return run_logged(root, _run)
 
 
 def _load_pull_dependencies():
@@ -444,6 +508,34 @@ def main(argv=None) -> int:
     )
     p_edge.add_argument("--root", default=None, help="项目根目录（默认自动推断）")
 
+    p_pull_logged = sub.add_parser(
+        "pull-logged",
+        help="计划任务用：执行一次 pull，并把开始/结束/退出码写入 logs/pull-*.log",
+    )
+    p_pull_logged.add_argument(
+        "--cdp",
+        default="http://127.0.0.1:9222",
+        help="本机浏览器 CDP 调试地址",
+    )
+    p_pull_logged.add_argument(
+        "--timeout", type=int, default=30, help="捕获订单响应的超时秒数"
+    )
+    p_pull_logged.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="页面卡死时的刷新重试次数（默认 2）",
+    )
+    p_pull_logged.add_argument("--root", default=None, help="项目根目录（默认自动推断）")
+    p_pull_logged.add_argument(
+        "--no-notify", action="store_true", help="跳过企业微信推送"
+    )
+    p_pull_logged.add_argument(
+        "--no-store-notify",
+        action="store_true",
+        help="跳过门店群推送（主推送不受影响）",
+    )
+
     args = parser.parse_args(argv)
     root = Path(args.root) if args.root else _default_root()
 
@@ -473,6 +565,15 @@ def main(argv=None) -> int:
         )
     if args.command == "audit":
         return cmd_audit(root, args.date)
+    if args.command == "pull-logged":
+        return cmd_pull_logged(
+            root,
+            args.cdp,
+            args.timeout,
+            args.no_notify,
+            args.no_store_notify,
+            retries=args.retries,
+        )
     if args.command == "edge-watch":
         return cmd_edge_watch(
             args.cdp,
