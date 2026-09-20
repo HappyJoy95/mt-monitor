@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from src.mt_monitor import notify
-from src.mt_monitor.wechat_webhook import WechatWebhookClient
+from src.mt_monitor.wechat_webhook import WechatWebhookClient, WechatWebhookError
 
 VALID_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=ABC123"
 
@@ -245,6 +245,151 @@ class MidnightCrossingTest(unittest.TestCase):
             mock_dt.now.return_value = datetime(2026, 1, 1, 12, 0, 0)
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             self.assertFalse(notify._is_within_business_hours("22:00:00", "06:00:00"))
+
+
+class PushEventTest(unittest.TestCase):
+    """Per-push traceability: which group, which robot, what result.
+
+    "企业微信推送：成功 1 笔" alone cannot answer "did my group get it?", which is
+    exactly the question raised when an order was not seen; these events are what
+    the scheduled run log now records.
+    """
+
+    DEFAULT_KEY = "DEFAULTKEY123456"
+    STORE_KEY = "STOREKEY123456"
+    DEFAULT_URL = (
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + DEFAULT_KEY
+    )
+    STORE_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + STORE_KEY
+
+    def _root(self, store_hours=("00:00:00", "23:59:59"), store_name="测试门店"):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "config").mkdir()
+        (root / "config" / "notify").write_text(self.DEFAULT_URL, encoding="utf-8")
+        (root / "config" / "store_webhooks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "门店名": store_name,
+                        "营业开始时间": store_hours[0],
+                        "营业结束时间": store_hours[1],
+                        "webhook": self.STORE_URL,
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def _run(self, root, order, events, **kwargs):
+        with mock.patch.object(WechatWebhookClient, "send_text", return_value=None):
+            return notify.process_notifications(
+                [order],
+                root / "config" / "notify",
+                root=root,
+                on_event=events.append,
+                **kwargs,
+            )
+
+    def test_success_events_name_both_targets(self):
+        root = self._root()
+        order = {"order_id": "O1", "status": "待接单", "store": "测试门店"}
+        events = []
+
+        pushed, skipped = self._run(root, order, events)
+
+        self.assertEqual((pushed, skipped), (1, 0))
+        self.assertEqual(len(events), 2)
+        self.assertIn("推送主群 key=DEFAULTK… 订单 O1（待接单）→ 成功", events[0])
+        self.assertIn("推送门店群 测试门店 key=STOREKEY… 订单 O1（待接单）→ 成功", events[1])
+
+    def test_events_never_leak_the_full_robot_key(self):
+        root = self._root()
+        events = []
+        self._run(root, {"order_id": "O1", "status": "待接单", "store": "测试门店"}, events)
+        joined = "\n".join(events)
+        self.assertNotIn(self.DEFAULT_KEY, joined)
+        self.assertNotIn(self.STORE_KEY, joined)
+
+    def test_unmapped_store_is_reported_instead_of_silently_skipped(self):
+        root = self._root()
+        events = []
+
+        pushed, _ = self._run(
+            root, {"order_id": "O2", "status": "待接单", "store": "没登记的门店"}, events
+        )
+
+        self.assertEqual(pushed, 1)  # main group still gets it
+        self.assertTrue(
+            any("不在映射表" in e and "O2" in e for e in events), events
+        )
+
+    def test_out_of_hours_skip_is_reported_with_the_window(self):
+        root = self._root(store_hours=("00:00:00", "00:01:00"))
+        events = []
+
+        self._run(root, {"order_id": "O3", "status": "待接单", "store": "测试门店"}, events)
+
+        self.assertTrue(
+            any("非营业时间" in e and "00:00:00~00:01:00" in e for e in events), events
+        )
+
+    def test_store_failure_names_the_store_and_reason(self):
+        root = self._root()
+        events = []
+        error = WechatWebhookError("business_error")
+
+        with mock.patch.object(WechatWebhookClient, "send_text", side_effect=error):
+            pushed, _ = notify.process_notifications(
+                [{"order_id": "O4", "status": "待接单", "store": "测试门店"}],
+                root / "config" / "notify",
+                root=root,
+                on_event=events.append,
+            )
+
+        self.assertEqual(pushed, 0)
+        self.assertTrue(any("失败" in e and "O4" in e for e in events), events)
+
+    def test_main_push_failure_still_reports_the_store_success(self):
+        root = self._root()
+        events = []
+
+        def flaky(url):
+            client = mock.MagicMock()
+            if "DEFAULTKEY" in url:
+                client.send_text.side_effect = WechatWebhookError("network_error")
+            return client
+
+        with mock.patch.object(notify, "WechatWebhookClient", side_effect=flaky):
+            pushed, _ = notify.process_notifications(
+                [{"order_id": "O5", "status": "待接单", "store": "测试门店"}],
+                root / "config" / "notify",
+                root=root,
+                on_event=events.append,
+            )
+
+        self.assertEqual(pushed, 1)  # store group delivered
+        self.assertTrue(any("主群" in e and "失败" in e for e in events), events)
+        self.assertTrue(any("门店群" in e and "成功" in e for e in events), events)
+
+    def test_broken_event_hook_never_breaks_a_push(self):
+        root = self._root()
+
+        def boom(_message):
+            raise RuntimeError("日志回调炸了")
+
+        with mock.patch.object(WechatWebhookClient, "send_text", return_value=None):
+            pushed, _ = notify.process_notifications(
+                [{"order_id": "O6", "status": "待接单", "store": "测试门店"}],
+                root / "config" / "notify",
+                root=root,
+                on_event=boom,
+            )
+
+        self.assertEqual(pushed, 1)
 
 
 if __name__ == "__main__":

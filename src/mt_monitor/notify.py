@@ -144,6 +144,17 @@ def _save_seen(root: Path, seen: set) -> None:
     )
 
 
+def _key_hint(webhook_url: str) -> str:
+    """Short, non-secret identifier for a robot webhook, for logs.
+
+    "成功 1 笔" cannot answer "which group got it?" — logging the key prefix lets
+    a push be traced to a concrete robot without writing the secret to disk.
+    """
+    if "key=" not in webhook_url:
+        return "?"
+    return webhook_url.rsplit("key=", 1)[-1][:8] + "…"
+
+
 def process_notifications(
     orders: Iterable[dict],
     webhook_path: Path | str,
@@ -152,6 +163,7 @@ def process_notifications(
     dedup: bool = False,
     dry_run: bool = False,
     store_notify: bool = True,
+    on_event=None,
 ) -> tuple[int, int]:
     """Push each order as a text message. Returns ``(pushed, skipped)``.
 
@@ -165,7 +177,21 @@ def process_notifications(
     When set to True, orders whose ``order_id`` was already pushed are skipped.
     ``dry_run`` prints the message instead of sending and never persists the
     seen-set.
+
+    ``on_event(message)`` receives one line per push attempt — target (main or
+    which store), the robot's key prefix, the order and the outcome — including
+    the silent-by-design skips (store not in the mapping, outside business
+    hours). The scheduled runner passes ``print`` so every push is auditable in
+    ``logs/pull-*.log``; without it the messages still go to stderr.
     """
+    def emit(message: str) -> None:
+        print(message, file=sys.stderr)
+        if on_event is not None:
+            try:
+                on_event(message)
+            except Exception:  # noqa: BLE001 - logging must never break a push
+                pass
+
     root = Path(root)
     orders = list(orders)
     seen = _load_seen(root) if dedup else set()
@@ -175,18 +201,16 @@ def process_notifications(
     default_client = None
     if not dry_run:
         try:
-            default_client = WechatWebhookClient(load_webhook_url(Path(webhook_path)))
+            default_url = load_webhook_url(Path(webhook_path))
+            default_client = WechatWebhookClient(default_url)
         except WechatWebhookError as exc:
             if exc.code == "not_configured":
-                print(
+                emit(
                     "⚠️ 未配置企业微信 webhook（未设置环境变量 QYWECHAT_WEBHOOK，"
-                    "且 config/notify 不存在），跳过主推送。",
-                    file=sys.stderr,
+                    "且 config/notify 不存在），跳过主推送。"
                 )
             else:
-                print(
-                    f"⚠️ 企业微信 webhook 配置无效，跳过主推送：{exc}", file=sys.stderr
-                )
+                emit(f"⚠️ 企业微信 webhook 配置无效，跳过主推送：{exc}")
 
     store_map: dict[str, dict] = {}
     if store_notify:
@@ -215,8 +239,14 @@ def process_notifications(
                 default_client.send_text(text)
                 seen.add(oid)
                 order_pushed = True
+                emit(
+                    f"推送主群 key={_key_hint(default_url)} 订单 {oid}（{status}）→ 成功"
+                )
             except WechatWebhookError as exc:
-                print(f"⚠️ 主推送订单 {oid} 失败：{exc}", file=sys.stderr)
+                emit(
+                    f"⚠️ 推送主群 key={_key_hint(default_url)} 订单 {oid}（{status}）"
+                    f"失败：{exc}"
+                )
         # Store-specific webhook push
         store_name = order.get("store", "")
         entry = store_map.get(store_name)
@@ -230,16 +260,25 @@ def process_notifications(
                     client.send_text(text)
                     seen.add(oid)
                     order_pushed = True
+                    emit(
+                        f"推送门店群 {store_name} key={_key_hint(webhook_url)} "
+                        f"订单 {oid}（{status}）→ 成功"
+                    )
                 except WechatWebhookError as exc:
-                    print(
-                        f"⚠️ 门店推送订单 {oid}（{store_name}）失败：{exc}",
-                        file=sys.stderr,
+                    emit(
+                        f"⚠️ 推送门店群 {store_name} key={_key_hint(webhook_url)} "
+                        f"订单 {oid}（{status}）失败：{exc}"
                     )
             else:
-                print(
-                    f"ℹ️ 门店 {store_name} 当前非营业时间，跳过门店群推送。",
-                    file=sys.stderr,
+                emit(
+                    f"ℹ️ 门店 {store_name} 当前非营业时间"
+                    f"（{start_time}~{end_time}），跳过门店群推送（订单 {oid}）。"
                 )
+        elif store_name and store_notify:
+            emit(
+                f"ℹ️ 门店 {store_name!r} 不在映射表（config/store_webhooks.json），"
+                f"跳过门店群推送（订单 {oid}）。"
+            )
         if order_pushed:
             pushed += 1
 

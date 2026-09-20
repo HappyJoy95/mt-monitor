@@ -38,7 +38,11 @@ def _push(root: Path, orders, store_notify: bool = True) -> None:
         print(f"⚠️ 推送依赖缺失（需 requests），跳过推送：{exc}", file=sys.stderr)
         return
     pushed, skipped = notify.process_notifications(
-        orders, Path(root) / WEBHOOK_FILE, root=root, store_notify=store_notify
+        orders,
+        Path(root) / WEBHOOK_FILE,
+        root=root,
+        store_notify=store_notify,
+        on_event=print,
     )
     print(f"企业微信推送：成功 {pushed} 笔")
 
