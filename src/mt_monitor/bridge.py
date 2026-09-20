@@ -125,6 +125,18 @@ LOGIN_PROBE_INTERVAL = 1.5
 # detour only exists to force a state change, so it is fine to move on quickly:
 # live measurement is a hard "no response" on the already-active strip.
 DETOUR_WAIT = 2.5
+# A click that lands is answered in ~0.3s, so waiting 30s for a click that was
+# swallowed just burns the round. Instead: wait briefly, click again (a few
+# times), and let the round-level recovery handle a page that is truly stuck.
+# Live 2026-09-20: Playwright's click intermittently timed out in its
+# actionability check ("waiting for element to be visible, enabled and stable")
+# while the SPA re-rendered the list, and a re-click fixed it.
+CLICK_WAIT = 3.0
+CLICK_ATTEMPTS = 3
+CLICK_RETRY_PAUSE = 0.4
+# Give the SPA a moment to finish rendering after a tab switch, otherwise the
+# very next click can land mid-re-render and fire nothing.
+TAB_SETTLE_PAUSE = 0.6
 
 # The JS probe used for two purposes: (a) deciding the page is ready to click
 # again after a recovery reload, (b) sitting in the click call itself so a
@@ -683,13 +695,25 @@ def _capture_order_list(page, frame, label: str, timeout: int, on_event):
             _sleep(min(0.2, max(0.0, deadline - _monotonic())))
 
     def click_and_wait(label_to_click: str, wait_seconds: float, pred=matches_tag):
-        # Fence off everything older than this click.
-        del captured[:]
-        try:
-            _click_tab(frame, label_to_click)
-        except Exception as exc:  # noqa: BLE001 - classified by the caller
-            raise _ClickError(exc) from exc
-        return wait_for(pred, wait_seconds)
+        """Click ``label_to_click`` until a matching response arrives (or give up).
+
+        Each attempt fences off older responses, clicks, and waits only briefly:
+        an answer that is going to come arrives in ~0.3s, and a longer wait would
+        just delay the next click. Re-clicking is what recovers the live case
+        where the click landed while the SPA re-rendered the tab strip.
+        """
+        budget = min(wait_seconds, CLICK_WAIT)
+        for _attempt in range(CLICK_ATTEMPTS):
+            del captured[:]
+            try:
+                _click_tab(frame, label_to_click)
+            except Exception as exc:  # noqa: BLE001 - classified by the caller
+                raise _ClickError(exc) from exc
+            response = wait_for(pred, budget)
+            if response is not None:
+                return response
+            _sleep(CLICK_RETRY_PAUSE)
+        return None
 
     try:
         active = _probe_active_tab(frame, label)
@@ -698,10 +722,12 @@ def _capture_order_list(page, frame, label: str, timeout: int, on_event):
             # detour's own answer is irrelevant (it carries another tag), so wait
             # for *any* list response to know the SPA refetched.
             click_and_wait(_detour_label(label), DETOUR_WAIT, pred=any_list_response)
+            _sleep(TAB_SETTLE_PAUSE)
         response = click_and_wait(label, timeout)
         if response is None:
             on_event("点目标标签未拿到响应，改走「对面标签 → 目标标签」再试一次")
             click_and_wait(_detour_label(label), DETOUR_WAIT, pred=any_list_response)
+            _sleep(TAB_SETTLE_PAUSE)
             response = click_and_wait(label, timeout)
         if response is None:
             # Never fall back to "some other tab's list": that is precisely how a

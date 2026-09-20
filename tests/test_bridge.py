@@ -453,41 +453,45 @@ class CaptureProtocolTests(unittest.TestCase):
         )
         self.assertEqual(page.reloads, 0)
 
-    def test_swallowed_click_is_retried_through_the_opposite_tab(self):
-        # Live symptom: the click lands but the SPA fires nothing. One retry via
-        # the opposite tab must recover it without a page reload.
+    def test_swallowed_click_is_recovered_by_reclicking_the_same_tab(self):
+        # Live symptom: the click lands while the SPA re-renders, so no request
+        # fires. Re-clicking the same tab recovers it without a detour or reload.
         page = FakePage(payload=PAYLOAD, fail_times=1)
         with TemporaryDirectory() as directory, _patch_playwright(page), \
                 mock.patch.object(bridge, "_sleep", _fast):
             bridge.pull_order_list(Path(directory), **self.SHORT)
 
-        self.assertEqual(
-            page.clicks[:3],
-            [bridge.TAB_LABEL, bridge.OPPOSITE_TAB_LABEL, bridge.TAB_LABEL],
-        )
+        self.assertEqual(page.clicks[:2], [bridge.TAB_LABEL, bridge.TAB_LABEL])
+        self.assertEqual(page.reloads, 0)
+
+    def test_repeatedly_swallowed_clicks_fall_back_to_the_detour(self):
+        # If every same-tab re-click is swallowed, the detour (switch to the other
+        # tab and back) must still recover the round.
+        page = FakePage(payload=PAYLOAD, fail_times=bridge.CLICK_ATTEMPTS)
+        with TemporaryDirectory() as directory, _patch_playwright(page), \
+                mock.patch.object(bridge, "_sleep", _fast):
+            bridge.pull_order_list(Path(directory), **self.SHORT)
+
+        self.assertIn(bridge.OPPOSITE_TAB_LABEL, page.clicks)
+        self.assertEqual(page.clicks[-2:], [bridge.TAB_LABEL, bridge.FALLBACK_TAB])
         self.assertEqual(page.reloads, 0)
 
     def test_page_fires_nothing_at_all_and_the_pull_recovers_by_reloading(self):
-        # Nothing arrives for the whole first capture round (target click, the
-        # retry through the opposite tab, and the same for the second tab). The
-        # pull must escalate to a page reload instead of giving up.
-        page = FakePage(payload=PAYLOAD, fail_times=3)  # whole first round dead
+        # Nothing arrives for the whole first capture round (all same-tab and
+        # detour clicks swallowed). The pull must escalate to a page reload
+        # instead of giving up.
+        dead_round = bridge.CLICK_ATTEMPTS * 3
+        page = FakePage(payload=PAYLOAD, fail_times=dead_round)
         with TemporaryDirectory() as directory, _patch_playwright(page), \
                 mock.patch.object(bridge, "_sleep", _fast):
             bridge.pull_order_list(Path(directory), **self.SHORT)
 
         self.assertEqual(page.reloads, 1)
-        self.assertEqual(
-            page.clicks,
-            [
-                bridge.TAB_LABEL,           # target: swallowed
-                bridge.OPPOSITE_TAB_LABEL,  # detour: swallowed
-                bridge.TAB_LABEL,           # retry: swallowed -> round failed
-                bridge.FALLBACK_TAB,        # after the reload: detour
-                bridge.TAB_LABEL,           # target captured
-                bridge.FALLBACK_TAB,        # second tab captured
-            ],
-        )
+        self.assertEqual(page.clicks[:dead_round], [bridge.TAB_LABEL] * bridge.CLICK_ATTEMPTS
+                         + [bridge.OPPOSITE_TAB_LABEL] * bridge.CLICK_ATTEMPTS
+                         + [bridge.TAB_LABEL] * bridge.CLICK_ATTEMPTS)
+        # After the reload both tabs are captured again.
+        self.assertEqual(page.clicks[-2:], [bridge.TAB_LABEL, bridge.FALLBACK_TAB])
 
 
 class PullSelfHealTests(unittest.TestCase):
@@ -576,9 +580,13 @@ class PullSelfHealTests(unittest.TestCase):
                     bridge.pull_order_list(Path(directory), max_attempts=1)
 
             self.assertEqual(page.reloads, 0)
+            # A dead page costs the same-tab re-clicks (CLICK_ATTEMPTS), then the
+            # detour re-clicks, then the target again — and no page reload.
             self.assertEqual(
                 page.clicks,
-                [bridge.TAB_LABEL, bridge.OPPOSITE_TAB_LABEL, bridge.TAB_LABEL],
+                [bridge.TAB_LABEL] * bridge.CLICK_ATTEMPTS
+                + [bridge.OPPOSITE_TAB_LABEL] * bridge.CLICK_ATTEMPTS
+                + [bridge.TAB_LABEL] * bridge.CLICK_ATTEMPTS,
             )
 
     def test_payload_without_order_list_is_retryable(self):
