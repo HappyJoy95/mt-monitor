@@ -33,9 +33,17 @@ class StuckPage(Exception):
 
 
 class FakeRequest:
-    def __init__(self, method="POST", url=None):
+    def __init__(self, method="POST", url=None, post_data=None):
         self.method = method
         self.url = url or f"https://shangoue.meituan.com/gw/api/order{ORDER_PATH}"
+        # The tab is identified by the POST body's tag: every tab hits the same
+        # URL, so the bridge filters responses on this field (a late detour
+        # answer must never pass as the target's list).
+        self.post_data = post_data if post_data is not None else _tag_body("进行中")
+
+
+def _tag_body(label: str) -> str:
+    return f"tag={bridge.TAB_TAGS.get(label, '')}&pageParam=%7B%7D"
 
 
 class FakeResponse:
@@ -117,6 +125,9 @@ class FakeFrame:
             raise TimeoutError("Timeout 5000ms exceeded waiting for the tab")
         page.clicks.append(label)
         page.clicks_fired += 1
+        # Selecting a tab makes it the active one (the SPA remembers the choice),
+        # so a later capture of the *other* tab does not need a detour.
+        page.active_label = label
         if page.swap_frame_on_first_click is not None:
             # The SPA re-renders and replaces the iframe while we click.
             page.current_frame = page.swap_frame_on_first_click
@@ -140,7 +151,7 @@ class FakeFrame:
             payload = page.script.pop(0)
             if payload is None:
                 return
-        page.emit(FakeResponse(payload))
+        page.emit(FakeResponse(payload, FakeRequest(post_data=_tag_body(label))))
 
 
 class FakeContext:
@@ -332,24 +343,61 @@ PAYLOAD = {
 
 
 class TabStrategyTests(unittest.TestCase):
-    """The target tab is a cross-machine contract, not an implementation detail.
+    """The captured tab set is a cross-machine contract, not a detail.
 
-    The Windows side relies on "进行中" carrying the orders of every state;
-    :mod:`normalize` then keeps only the statuses worth pushing. Changing the
-    target here silently narrows the monitored order set, so pin it.
+    Both tabs must be captured because their order sets are disjoint: 待接单
+    (``order_new``) holds the orders awaiting acceptance while 进行中
+    (``order_processing``) holds 待发起配送 and every later live state. Capturing
+    only one of them silently drops the other — which is how 待发起配送 went
+    missing for days while the 待接单 tab happened to answer first.
     """
 
-    def test_target_tab_is_the_all_orders_tab(self):
+    def test_target_tab_is_the_live_orders_tab(self):
         self.assertEqual(bridge.TARGET_TAB, "进行中")
         self.assertEqual(bridge.TAB_LABEL, bridge.TARGET_TAB)
 
-    def test_fallback_tab_differs_from_the_target(self):
-        # The detour only works if it lands on a *different* tab.
+    def test_both_disjoint_tabs_are_captured(self):
+        self.assertEqual(bridge.TARGET_TABS, (bridge.TARGET_TAB, bridge.FALLBACK_TAB))
         self.assertNotEqual(bridge.FALLBACK_TAB, bridge.TARGET_TAB)
 
-    def test_capture_keeps_the_response_from_the_target_tab(self):
+    def test_each_captured_tab_has_its_own_request_tag(self):
+        # The tag is the only way to tell the two responses apart (same URL), so
+        # an unknown/missing tag would make the filter useless.
+        tags = [bridge.TAB_TAGS.get(label, "") for label in bridge.TARGET_TABS]
+        self.assertTrue(all(tags), f"缺少 tag 映射：{bridge.TARGET_TABS}")
+        self.assertEqual(len(set(tags)), len(tags))
+
+    def test_detour_never_returns_the_same_tab(self):
+        for label in bridge.TARGET_TABS:
+            self.assertNotEqual(bridge._detour_label(label), label)
+
+    def test_merge_keeps_both_tabs_orders_once_each(self):
+        def order(oid):
+            return {"commonInfo": json.dumps({"wm_order_id_view": oid})}
+
+        merged = bridge._merge_payloads(
+            [
+                {"code": 0, "data": {"orderList": [order("A"), order("B")]}},
+                {"code": 0, "data": {"orderList": [order("B"), order("C")]}},
+            ],
+            list(bridge.TARGET_TABS),
+        )
+
+        ids = [bridge._order_key(o) for o in merged["data"]["orderList"]]
+        self.assertEqual(ids, ["A", "B", "C"])  # union, de-duplicated
+        self.assertEqual(merged["data"]["capturedTabs"], list(bridge.TARGET_TABS))
+
+    def test_capture_accepts_only_the_response_carrying_the_asked_tag(self):
+        # Regression: a late answer to the *detour* click used to be taken for
+        # the target's list (2026-09-20 11:42 dropped a live 待发起配送 order).
         page = FakePage(payload=PAYLOAD)
         page.active_label = bridge.FALLBACK_TAB
+        # The detour fires 待接单's response while 进行中 is being awaited. With
+        # tag matching it must be ignored; the 进行中 answer is what gets stored.
+        page.script = [
+            {"code": 0, "data": {"orderList": []}},                    # target 进行中
+            {"code": 0, "data": {"orderList": []}},                    # second tab
+        ]
         with TemporaryDirectory() as directory, _patch_playwright(page), \
                 mock.patch.object(bridge, "_sleep", _fast):
             root = Path(directory)
@@ -359,8 +407,12 @@ class TabStrategyTests(unittest.TestCase):
             # Assert inside the context: TemporaryDirectory removes the files on
             # exit, so a later check would test the cleanup, not the pull.
             self.assertTrue(Path(raw_path).exists())
+            payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
 
-        self.assertEqual(page.clicks, [bridge.TARGET_TAB])
+        self.assertEqual(
+            payload["data"]["capturedTabs"], list(bridge.TARGET_TABS)
+        )
+        self.assertEqual(payload["data"]["orderList"], [])
 
 
 class CaptureProtocolTests(unittest.TestCase):
@@ -376,14 +428,14 @@ class CaptureProtocolTests(unittest.TestCase):
     SHORT = dict(timeout=1, ready_timeout=1)
 
     def test_inactive_target_tab_is_clicked_once(self):
-        # Fresh page: the target tab is not selected, so one click triggers the
-        # list request and no detour is needed.
+        # Fresh page: neither tab is selected, so one click each triggers both
+        # list requests and no detour is needed.
         page = FakePage(payload=PAYLOAD)
         with TemporaryDirectory() as directory, _patch_playwright(page), \
                 mock.patch.object(bridge, "_sleep", _fast):
             bridge.pull_order_list(Path(directory), **self.SHORT)
 
-        self.assertEqual(page.clicks, [bridge.TAB_LABEL])
+        self.assertEqual(page.clicks, list(bridge.TARGET_TABS))
         self.assertEqual(page.reloads, 0)
 
     def test_active_target_tab_detours_through_the_opposite_tab(self):
@@ -396,7 +448,8 @@ class CaptureProtocolTests(unittest.TestCase):
             bridge.pull_order_list(Path(directory), **self.SHORT)
 
         self.assertEqual(
-            page.clicks, [bridge.OPPOSITE_TAB_LABEL, bridge.TAB_LABEL]
+            page.clicks,
+            [bridge.OPPOSITE_TAB_LABEL, bridge.TAB_LABEL, bridge.FALLBACK_TAB],
         )
         self.assertEqual(page.reloads, 0)
 
@@ -409,15 +462,15 @@ class CaptureProtocolTests(unittest.TestCase):
             bridge.pull_order_list(Path(directory), **self.SHORT)
 
         self.assertEqual(
-            page.clicks,
+            page.clicks[:3],
             [bridge.TAB_LABEL, bridge.OPPOSITE_TAB_LABEL, bridge.TAB_LABEL],
         )
         self.assertEqual(page.reloads, 0)
 
     def test_page_fires_nothing_at_all_and_the_pull_recovers_by_reloading(self):
-        # Nothing arrives for the whole first capture round (target click, then
-        # the retry through the opposite tab). The pull must escalate to a page
-        # reload instead of giving up.
+        # Nothing arrives for the whole first capture round (target click, the
+        # retry through the opposite tab, and the same for the second tab). The
+        # pull must escalate to a page reload instead of giving up.
         page = FakePage(payload=PAYLOAD, fail_times=3)  # whole first round dead
         with TemporaryDirectory() as directory, _patch_playwright(page), \
                 mock.patch.object(bridge, "_sleep", _fast):
@@ -430,7 +483,9 @@ class CaptureProtocolTests(unittest.TestCase):
                 bridge.TAB_LABEL,           # target: swallowed
                 bridge.OPPOSITE_TAB_LABEL,  # detour: swallowed
                 bridge.TAB_LABEL,           # retry: swallowed -> round failed
-                bridge.TAB_LABEL,           # after the reload: captured
+                bridge.FALLBACK_TAB,        # after the reload: detour
+                bridge.TAB_LABEL,           # target captured
+                bridge.FALLBACK_TAB,        # second tab captured
             ],
         )
 
@@ -451,8 +506,10 @@ class PullSelfHealTests(unittest.TestCase):
                 raw_path, summary_path = bridge.pull_order_list(root)
 
             self.assertEqual(page.reloads, 1)
+            # Both tabs are captured per pull, so the round ends on the second
+            # tab (待接单) rather than on TARGET_TAB.
             self.assertEqual(
-                page.clicks[-1], bridge.TAB_LABEL
+                page.clicks[-2:], [bridge.TARGET_TAB, bridge.FALLBACK_TAB]
             )
             self.assertTrue(Path(raw_path).exists())
             self.assertEqual(
@@ -559,7 +616,9 @@ class PullSelfHealTests(unittest.TestCase):
                     bridge.pull_order_list(Path(directory), max_attempts=2)
 
             self.assertEqual(page.reloads, 1)
-            self.assertEqual(page.attempts, 2)
+            # Two tabs are captured per round, so a round costs two clicks whose
+            # responses carry no orderList → both are recorded as attempts.
+            self.assertEqual(page.attempts, 3)
 
     def test_detached_iframe_is_refetched_and_clicked_again(self):
         # Live evidence: the iframe can be swapped out between readiness and the
@@ -581,8 +640,10 @@ class PullSelfHealTests(unittest.TestCase):
 
             self.assertTrue(Path(raw_path).exists())
             self.assertEqual(page.reloads, 0)
-            # The target click was retried against the re-resolved iframe.
-            self.assertEqual(page.clicks[-1], bridge.TAB_LABEL)
+            # The target click was retried against the re-resolved iframe; the
+            # round then also captures the second tab.
+            self.assertIn(bridge.TARGET_TAB, page.clicks)
+            self.assertEqual(page.clicks[-2:], [bridge.TARGET_TAB, bridge.FALLBACK_TAB])
 
     def test_frame_ready_but_tab_absent_fails_with_a_page_problem(self):
         # The unauthenticated order page renders `hashframe` but never the state
@@ -599,7 +660,9 @@ class PullSelfHealTests(unittest.TestCase):
                         Path(directory), max_attempts=1, ready_timeout=5
                     )
 
-            self.assertIn("超时未捕获", str(ctx.exception))
+            # The failure must name the missing tagged response, so a Meituan
+            # rename of the tab's request tag is diagnosable from the log.
+            self.assertIn("未捕获到 tag=", str(ctx.exception))
             self.assertEqual(page.captured, [])  # nothing was ever captured
 
     def test_cdp_connect_failure_is_reported_and_recorded(self):

@@ -12,7 +12,8 @@
 
 ## 功能概述
 
-1. **订单采集**：通过 CDP 桥接本地已登录浏览器，点「进行中」标签捕获全状态订单列表，
+1. **订单采集**：通过 CDP 桥接本地已登录浏览器，每轮抓「进行中」+「待接单」两个
+   互斥标签并合并（两类集合不重叠，只抓一个必漏另一类），
    再由 `normalize` 过滤出「待接单」+「待发起配送」（后者需进入拣货完成前 6 分钟窗口）
 2. **主推送**：所有订单推送到主企业微信群（`config/notify` 或 `QYWECHAT_WEBHOOK` 环境变量）
 3. **门店推送**：按门店名精确匹配，推送到对应门店群（`config/store_webhooks.json`）
@@ -118,11 +119,16 @@ complete + `hashframe` iframe 挂上 + 目标标签可点）再重新点标签�
 
 ### 目标标签与订单范围（跨机器约定）
 
-`bridge.TARGET_TAB = "进行中"`（该列表含各状态订单），实际监控哪些状态由
-`normalize.VALID_STATUSES = {"待接单", "待发起配送"}` 决定；「待发起配送」还要满足
-`canClickButtonTime - 6 分钟`（`PICK_READY_OFFSET_MINUTES`，2026-09-17 由 3 分钟调大）
-才推送。`tests/test_bridge.py::TabStrategyTests` 把这个
-约定钉住了——改 `TARGET_TAB` 会静默缩小监控范围，别当成实现细节随手改。
+`bridge.TARGET_TABS = ("进行中", "待接单")`——**两类订单集合互不重叠**（实测一个月
+抓取里，"待接单" 与任何在途状态从未出现在同一个响应里），所有标签打的是同一个接口、
+URL 相同，只有请求体 `tag` 能区分（进行中=`order_processing`、待接单=`order_new`）。
+因此每轮必须抓两个标签并按 `tag` 匹配响应后合并；早期只接受"最后一个响应"会让每分钟
+随机只覆盖一类，**待发起配送就这样长期抓不到**。
+
+实际监控哪些状态由 `normalize.VALID_STATUSES = {"待接单", "待发起配送"}` 决定；
+「待发起配送」还要满足 `canClickButtonTime - 6 分钟`（`PICK_READY_OFFSET_MINUTES`，
+2026-09-17 由 3 分钟调大）才推送。`tests/test_bridge.py::TabStrategyTests` 把这些
+约定钉住了——改动标签集合或 tag 映射会静默缩小监控范围，别当成实现细节随手改。
 
 ### 定位逻辑的三个硬约束（真机实测，别再踩）
 

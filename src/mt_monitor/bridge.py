@@ -77,13 +77,32 @@ ORDER_PAGE_MARKERS = ("shangoue.meituan.com", "orderbusiness")
 ORDER_PAGE_URL = (
     "https://shangoue.meituan.com/#/page/orderbusiness#/order/unprocessed"
 )
-# Click "进行中" tab to get all orders, then filter by status.
+# Every state tab asks the *same* endpoint, so the URL cannot tell which tab
+# asked — only the POST body's ``tag`` can. Matching on the URL alone let a late
+# detour response pass as the target's: on 2026-09-20 11:42 the page had one
+# 待发起配送 order under 进行中, the pull still recorded zero orders, and the
+# order was never pushed.
+TAB_TAGS = {
+    "待接单": "order_new",
+    "进行中": "order_processing",
+    "待发配送": "order_prepLogistics",
+    "全部": "order_all",
+}
+# Click "进行中" tab to get every live order, then filter by status in normalize.
 TARGET_TAB = "进行中"
 TAB_LABEL = TARGET_TAB
-# Clicked only to force a state change when TARGET_TAB is already selected:
-# re-clicking the active tab is a no-op, so no request would be fired.
+# Clicked to force a state change when TARGET_TAB is already selected, and also
+# captured in its own right: re-clicking the active tab is a no-op, so no request
+# would be fired.
 FALLBACK_TAB = "待接单"
 OPPOSITE_TAB_LABEL = FALLBACK_TAB
+# Both tabs are captured on every pull because their order sets are *disjoint*:
+# across 13354 September captures not one response ever mixed 待接单 with an
+# in-progress status. 待接单 -> order_new holds the orders awaiting acceptance;
+# 进行中 -> order_processing holds 待发起配送 and every later live state. A single
+# response can therefore never carry both, while normalize needs both in order to
+# push 待接单 + 待发起配送.
+TARGET_TABS = (TARGET_TAB, FALLBACK_TAB)
 # CSS Modules hash the class name, and the hash changes between Meituan builds
 # (seen: `tab-btn_c17`, later `tab-btn_c17d4`). A prefix match on the *stable*
 # part keeps working across those redeploys. The JS readiness probe is handed
@@ -492,6 +511,77 @@ def open_order_page(browser):
 # --------------------------------------------------------------------------
 # Capture
 # --------------------------------------------------------------------------
+def _tab_tag(label: str) -> str:
+    """The request ``tag`` a tab click is expected to send ("" when unknown)."""
+    return TAB_TAGS.get(label, "")
+
+
+def _detour_label(label: str) -> str:
+    """A *different* tab to click so the SPA refetches while ``label`` is active."""
+    for candidate in TARGET_TABS:
+        if candidate != label:
+            return candidate
+    return FALLBACK_TAB if label != FALLBACK_TAB else TARGET_TAB
+
+
+def _order_key(order) -> str:
+    """Stable identity of one raw order, for de-duplicating merged responses."""
+    try:
+        return str(
+            json.loads(order.get("commonInfo", "{}")).get("wm_order_id_view", "")
+        )
+    except Exception:  # noqa: BLE001 - identity is best effort
+        return ""
+
+
+def _merge_payloads(payloads, labels) -> dict:
+    """Union of several tab responses, de-duplicated by order id.
+
+    ``待接单`` and ``进行中`` answer with disjoint order sets, so a pull has to
+    merge them to see every order worth pushing. The first occurrence wins, and
+    ``data.capturedTabs`` records which tabs contributed, so an archived raw file
+    explains itself later. Pagination metadata is copied from the first response
+    and is therefore only indicative.
+    """
+    orders = []
+    seen = set()
+    for payload in payloads:
+        for order in (payload.get("data") or {}).get("orderList") or []:
+            key = _order_key(order)
+            if key:
+                if key in seen:
+                    continue
+                seen.add(key)
+            orders.append(order)
+
+    base = dict(payloads[0]) if payloads else {"code": 0, "msg": "success"}
+    data = dict(base.get("data") or {})
+    data["orderList"] = orders
+    data["capturedTabs"] = list(labels)
+    base["data"] = data
+    return base
+
+
+def _capture_order_lists(page, frame, timeout: int, on_event, labels=TARGET_TABS) -> dict:
+    """Capture one response per target tab and merge them into a single payload.
+
+    Both tabs are needed because their order sets are disjoint (see
+    ``TARGET_TABS``): a single response would silently drop either the 待接单 or
+    the 待发起配送 orders — the bug that hid 待发起配送 for days. A failure on any
+    tab fails the round, so the caller's recovery (reload + retry) can take over
+    instead of archiving a quietly incomplete list.
+    """
+    payloads = []
+    captured_labels = []
+    for label in labels:
+        try:
+            payloads.append(_capture_order_list(page, frame, label, timeout, on_event))
+        except TransientBridgeError as exc:
+            raise TransientBridgeError(f"抓取「{label}」标签失败：{exc}") from exc
+        captured_labels.append(label)
+    return _merge_payloads(payloads, captured_labels)
+
+
 def _capture_order_list(page, frame, label: str, timeout: int, on_event):
     """Trigger a fresh order-list request and return the captured payload.
 
@@ -513,49 +603,80 @@ def _capture_order_list(page, frame, label: str, timeout: int, on_event):
     fallback tab, so a swallowed click no longer costs a whole page reload.
     """
     captured = []
-    # Filter on the *request* URL: Playwright's response.url can differ after
-    # redirects, while request.url is exactly what the page asked for.
-    pred = (
-        lambda r: getattr(r.request, "method", "") == "POST"
-        and ORDER_LIST_PATH in (getattr(r.request, "url", "") or "")
+    wanted_tag = _tab_tag(label)
+
+    def is_list_request(request) -> bool:
+        # Filter on the *request* URL: Playwright's response.url can differ after
+        # redirects, while request.url is exactly what the page asked for.
+        return (
+            getattr(request, "method", "") == "POST"
+            and ORDER_LIST_PATH in (getattr(request, "url", "") or "")
+        )
+
+    def matches_tag(response) -> bool:
+        # Every tab hits the same URL, so the request body's tag is the only way
+        # to tell which tab a response answers. Without this check a slow detour
+        # answer was accepted as the target's list (2026-09-20: a live
+        # 待发起配送 order was dropped and never pushed).
+        request = getattr(response, "request", None)
+        if not is_list_request(request):
+            return False
+        body = getattr(request, "post_data", None) or ""
+        return f"tag={wanted_tag}" in body
+
+    def any_list_response(response) -> bool:
+        return is_list_request(getattr(response, "request", None))
+
+    listener = (
+        lambda response: captured.append(response)
+        if any_list_response(response)
+        else None
     )
-    listener = lambda response: captured.append(response) if pred(response) else None
     page.on("response", listener)
 
-    def click_and_wait(label_to_click: str, wait_seconds: float) -> bool:
-        before = len(captured)
+    def wait_for(pred, wait_seconds):
         deadline = _monotonic() + wait_seconds
-        try:
-            _click_tab(frame, label_to_click)
-        except Exception as exc:  # noqa: BLE001 - classified by the caller
-            raise _ClickError(exc) from exc
         while True:
             # Check before sleeping, and sleep in short slices: the live page
             # answers in ~0.3s, and a full-length sleep here would make every
             # pull wait out the whole budget even on the happy path.
-            if len(captured) > before:
-                return True
+            for index, response in enumerate(captured):
+                if pred(response):
+                    return captured.pop(index)
             if _monotonic() >= deadline:
-                return False
+                return None
             _sleep(min(0.2, max(0.0, deadline - _monotonic())))
+
+    def click_and_wait(label_to_click: str, wait_seconds: float, pred=matches_tag):
+        # Fence off everything older than this click.
+        del captured[:]
+        try:
+            _click_tab(frame, label_to_click)
+        except Exception as exc:  # noqa: BLE001 - classified by the caller
+            raise _ClickError(exc) from exc
+        return wait_for(pred, wait_seconds)
 
     try:
         active = _probe_active_tab(frame, label)
         if active is True:
-            # Nothing would be requested without leaving the tab first.
-            click_and_wait(FALLBACK_TAB, DETOUR_WAIT)
-        # Drop anything the detour produced (including a late arrival): only a
-        # response that follows the *target* click may be treated as the list.
-        del captured[:]
-        if not click_and_wait(label, timeout):
+            # Nothing would be requested without leaving the tab first. The
+            # detour's own answer is irrelevant (it carries another tag), so wait
+            # for *any* list response to know the SPA refetched.
+            click_and_wait(_detour_label(label), DETOUR_WAIT, pred=any_list_response)
+        response = click_and_wait(label, timeout)
+        if response is None:
             on_event("点目标标签未拿到响应，改走「对面标签 → 目标标签」再试一次")
-            click_and_wait(FALLBACK_TAB, DETOUR_WAIT)
-            del captured[:]
-            if not click_and_wait(label, timeout):
-                raise TransientBridgeError(
-                    "超时未捕获到订单列表接口响应（页面可能已卡死或未加载完）"
-                )
-        response = captured[-1]
+            click_and_wait(_detour_label(label), DETOUR_WAIT, pred=any_list_response)
+            response = click_and_wait(label, timeout)
+        if response is None:
+            # Never fall back to "some other tab's list": that is precisely how a
+            # 待发起配送 order was silently dropped (2026-09-20). Fail loudly
+            # instead — the message names the tag, so a Meituan rename of the tab
+            # tag is diagnosable.
+            raise TransientBridgeError(
+                f"未捕获到 tag={wanted_tag} 的列表响应（{label} 标签），"
+                "标签请求体可能已改版；本次未归档任何订单列表"
+            )
     except _ClickError as err:
         exc = err.cause
         # A reload/navigation between readiness and the click detaches the frame
@@ -569,13 +690,12 @@ def _capture_order_list(page, frame, label: str, timeout: int, on_event):
         try:
             # Force a state change unconditionally: after an iframe swap we no
             # longer know which tab the SPA considers selected.
-            click_and_wait(FALLBACK_TAB, DETOUR_WAIT)
-            del captured[:]
-            if not click_and_wait(label, timeout):
+            click_and_wait(_detour_label(label), DETOUR_WAIT)
+            response = click_and_wait(label, timeout)
+            if response is None:
                 raise TransientBridgeError(
                     "超时未捕获到订单列表接口响应（页面可能已卡死或未加载完）"
                 )
-            response = captured[-1]
         except _ClickError as retry_err:
             inner = retry_err.cause
             raise TransientBridgeError(
@@ -615,12 +735,14 @@ def pull_order_list(
     ready_timeout: int = 20,
     on_event=None,
 ):
-    """Connect to the local browser, capture the order-list response and archive
-    it under ``raw/`` plus ``data/latest-new-orders.json``.
+    """Connect to the local browser, capture the order-list responses and archive
+    them under ``raw/`` plus ``data/latest-new-orders.json``.
 
-    ``TARGET_TAB`` ("进行中") carries the orders of every state; which of them
-    are worth keeping is decided in :mod:`normalize` (status filter + pickup
-    window), so one capture per pull is enough.
+    Two tabs are captured per pull (``TARGET_TABS``) because their order sets are
+    disjoint — ``待接单`` (tag ``order_new``) and ``进行中`` (tag
+    ``order_processing``, which carries 待发起配送 and every later live state) —
+    and the responses are merged into one archived payload. Which statuses are
+    worth pushing is still decided in :mod:`normalize`.
 
     The live ``mtgsig`` signature is produced by the browser itself, so no saved
     request template or auth file is needed — we only reuse the browser's
@@ -716,7 +838,7 @@ def pull_order_list(
                         page_probe=_login_check,
                     )
                     frame = page.frame(name=ORDER_FRAME_NAME) or page
-                    payload = _capture_order_list(page, frame, label, timeout, _emit)
+                    payload = _capture_order_lists(page, frame, timeout, _emit)
                 except AuthExpiredError as exc:
                     # Raised by _capture_order_list (e.g. the endpoint answered
                     # 401/403). No page recovery is attempted: only a human can
