@@ -46,7 +46,6 @@ def _push(root: Path, orders, store_notify: bool = True) -> None:
     )
     print(f"企业微信推送：成功 {pushed} 笔")
 
-
 def cmd_import(
     root: Path, source: str, no_notify: bool = False, no_store_notify: bool = False
 ) -> int:
@@ -96,6 +95,18 @@ def cmd_audit(root: Path, day: str | None = None) -> int:
     return 0 if report.ok else 1
 
 
+def _pull_event_printer():
+    """Print bridge events, prefixing a warning marker unless the event already
+    carries its own level marker (the per-round capture tally is informational and
+    must not look like a problem in the run log)."""
+
+    def _print(message: str) -> None:
+        marker = "" if message[:1] in ("ℹ", "✅", "⚠") else "⚠️ "
+        print(f"{marker}{message}", file=sys.stderr)
+
+    return _print
+
+
 def cmd_pull(
     root: Path,
     cdp_url: str,
@@ -136,7 +147,7 @@ def cmd_pull(
             cdp_url=cdp_url,
             timeout=timeout,
             max_attempts=max(1, retries + 1),
-            on_event=lambda message: print(f"⚠️ {message}", file=sys.stderr),
+            on_event=_pull_event_printer(),
         )
     except ImportError:
         # Belt-and-suspenders in case playwright is missing deeper down. The

@@ -408,6 +408,22 @@ def _raise_auth_expired(root, page, detail, emit, why) -> None:
     )
 
 
+def _recovery_tier(page, label: str, recoveries: int) -> int:
+    """Which recovery level to use for the next attempt.
+
+    Soft/hard reloads re-run the *same* SPA bundle, so they cannot cure an order
+    module that never rendered — on 2026-09-20 the iframe sat on "加载中..." with
+    zero tab buttons, three rounds of soft/hard reloads failed, and a single
+    navigate brought the tabs back. So when the target tab is not clickable, jump
+    straight to the navigate tier; otherwise keep the gentle soft→hard ladder.
+    """
+    frame = page.frame(name=ORDER_FRAME_NAME)
+    probe = _probe_tab(frame, label) if frame is not None else None
+    if probe is not True:
+        return 2
+    return recoveries
+
+
 def _reload_page(page, tier: int, timeout: float, on_event) -> bool:
     """Bring a stuck page back to life. Returns ``True`` when the reload itself
     went through (readiness is checked separately by ``_wait_until_ready``).
@@ -570,16 +586,35 @@ def _capture_order_lists(page, frame, timeout: int, on_event, labels=TARGET_TABS
     the 待发起配送 orders — the bug that hid 待发起配送 for days. A failure on any
     tab fails the round, so the caller's recovery (reload + retry) can take over
     instead of archiving a quietly incomplete list.
+
+    Per-tab counts are reported, because "订单摘要：0 笔" alone cannot tell a
+    genuinely empty list from "the wrong tab answered" — the counters make the
+    next such question answerable straight from the run log.
     """
     payloads = []
     captured_labels = []
+    counts = []
     for label in labels:
         try:
-            payloads.append(_capture_order_list(page, frame, label, timeout, on_event))
+            payload = _capture_order_list(page, frame, label, timeout, on_event)
         except TransientBridgeError as exc:
             raise TransientBridgeError(f"抓取「{label}」标签失败：{exc}") from exc
+        payloads.append(payload)
         captured_labels.append(label)
-    return _merge_payloads(payloads, captured_labels)
+        counts.append(len((payload.get("data") or {}).get("orderList") or []))
+
+    merged = _merge_payloads(payloads, captured_labels)
+    total = len((merged.get("data") or {}).get("orderList") or [])
+    detail = " + ".join(
+        f"{label} {count} 笔" for label, count in zip(captured_labels, counts)
+    )
+    dropped = sum(counts) - total
+    on_event(
+        f"ℹ️ 本轮抓取：{detail}（去重合并后 {total} 笔"
+        + (f"，重复 {dropped} 笔" if dropped else "")
+        + "）"
+    )
+    return merged
 
 
 def _capture_order_list(page, frame, label: str, timeout: int, on_event):
@@ -861,7 +896,12 @@ def pull_order_list(
                     _emit(
                         f"第 {attempt + 1} 次尝试失败（{exc}），准备刷新页面后重试"
                     )
-                    if not _reload_page(page, recoveries, reload_timeout, _emit):
+                    if not _reload_page(
+                        page,
+                        _recovery_tier(page, label, recoveries),
+                        reload_timeout,
+                        _emit,
+                    ):
                         break
                     recoveries += 1
                     # Let the SPA settle before probing readiness again.

@@ -646,9 +646,9 @@ class PullSelfHealTests(unittest.TestCase):
             self.assertEqual(page.clicks[-2:], [bridge.TARGET_TAB, bridge.FALLBACK_TAB])
 
     def test_frame_ready_but_tab_absent_fails_with_a_page_problem(self):
-        # The unauthenticated order page renders `hashframe` but never the state
-        # tabs. Readiness then times out and the pull must report a page
-        # problem (retryable), not silently return an empty list.
+        # The unauthenticated / stuck order page renders `hashframe` but never the
+        # state tabs. The pull must report a page problem (retryable), not
+        # silently return an empty list.
         page = FakePage(payload=PAYLOAD)
         page.current_frame = FakeFrame(page, label_present=False)
         with TemporaryDirectory() as directory:
@@ -664,6 +664,41 @@ class PullSelfHealTests(unittest.TestCase):
             # rename of the tab's request tag is diagnosable from the log.
             self.assertIn("未捕获到 tag=", str(ctx.exception))
             self.assertEqual(page.captured, [])  # nothing was ever captured
+
+    def test_stuck_module_recovers_by_navigating_instead_of_reloading(self):
+        # Live 2026-09-20: the order iframe sat on "加载中..." with no tab buttons;
+        # soft and hard reloads re-run the same broken bundle and three rounds
+        # failed, while a single navigate brought the tabs back.
+        page = FakePage(payload=PAYLOAD)
+        page.current_frame = FakeFrame(page, label_present=False)
+        with TemporaryDirectory() as directory:
+            with _patch_playwright(page), _instant()[0], _instant()[1], mock.patch.object(
+                bridge, "_monotonic", side_effect=_advancing_clock()
+            ):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.pull_order_list(
+                        Path(directory), max_attempts=2, ready_timeout=1
+                    )
+
+            self.assertEqual(page.goto_calls, [bridge.ORDER_PAGE_URL])
+            self.assertEqual(page.reloads, 0)
+
+    def test_capture_tally_is_reported_per_tab(self):
+        # "订单摘要：0 笔" cannot distinguish an empty list from a wrong-tab
+        # answer; the tally makes that answerable straight from the run log.
+        events = []
+        page = FakePage(payload=PAYLOAD)
+        with TemporaryDirectory() as directory, _patch_playwright(page), \
+                mock.patch.object(bridge, "_sleep", _fast):
+            bridge.pull_order_list(
+                Path(directory), timeout=1, ready_timeout=1, on_event=events.append
+            )
+
+        tally = [e for e in events if "本轮抓取" in e]
+        self.assertEqual(len(tally), 1)
+        for label in bridge.TARGET_TABS:
+            self.assertIn(label, tally[0])
+        self.assertIn("去重合并后 1 笔", tally[0])
 
     def test_cdp_connect_failure_is_reported_and_recorded(self):
         page = FakePage()
